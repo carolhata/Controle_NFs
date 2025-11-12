@@ -6,3 +6,4 @@ google-auth
 google-api-python-client
 pdfplumber
 watchdog
+python-magic  # Adicionado esta linha
