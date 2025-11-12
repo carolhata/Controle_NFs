@@ -7,4 +7,5 @@ google-api-python-client
 pdfplumber
 watchdog
 python-magic
-pytesseract  # Adicionado esta linha
+pytesseract
+gspread_dataframe  # Adicionado esta linha
