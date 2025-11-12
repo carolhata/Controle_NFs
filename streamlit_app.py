@@ -1,8 +1,9 @@
 # streamlit_app.py
 """
-App Streamlit: importar nota fiscal do Google Drive -> extrair campos -> escrever no Google Sheets
-Arquivos esperados: Google Docs, PDF pesquisável, PDF escaneado/imagem
-Autenticação: via Service Account JSON (colocado no Streamlit Secrets como "GOOGLE_SERVICE_ACCOUNT")
+Streamlit app: varre uma pasta do Google Drive, detecta arquivos novos,
+extrai campos de notas fiscais e grava no Google Sheets.
+- Requer: colocar JSON da Service Account em st.secrets["GOOGLE_SERVICE_ACCOUNT"]
+- Fluxo: listar pasta -> comparar com Processed_Files sheet -> processar novos -> anotar Processed_Files
 """
 
 import streamlit as st
@@ -22,59 +23,61 @@ from PIL import Image
 from gspread import authorize
 from gspread_dataframe import set_with_dataframe
 
-# ---------- Config / constantes ----------
-# escopos mínimos para Drive + Sheets
+st.set_page_config(page_title="Controle NF - Folder Watcher", layout="wide")
+st.title("📁 Monitor de pasta Drive → 🧾 → 📊 Google Sheets")
+
+# ---------- SCOPES ----------
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/spreadsheets"
 ]
 
-st.set_page_config(page_title="Controle NF — Extrator Drive → Sheets", layout="wide")
-
-st.title("📥 → 🧾 → 📊  Importador de Nota Fiscal (Google Drive → Google Sheets)")
-
-st.markdown(
-    """
-    **Fluxo:** o app acessa um arquivo no Google Drive (ID do arquivo), tenta extrair o texto,
-    busca campos chave (Nome da empresa, CNPJ, descrição dos itens com valores, data da compra, valor total, número da nota, CPF e endereço),
-    e escreve uma linha (ou várias, se houver várias notas) em uma planilha do Google Sheets.
-    """
-)
-
-# ---------- Helpers de autenticação ----------
+# ---------- Autenticação ----------
 @st.cache_resource
 def get_google_creds():
-    """
-    Lê a credencial da conta de serviço a partir do Streamlit secrets.
-    O segredo deve estar em: st.secrets["GOOGLE_SERVICE_ACCOUNT"] (string JSON ou dict).
-    """
     if "GOOGLE_SERVICE_ACCOUNT" not in st.secrets:
-        st.error("Credenciais Google não encontradas no Streamlit Secrets. Adicione 'GOOGLE_SERVICE_ACCOUNT'.")
+        st.error("Coloque o JSON da Service Account em Settings → Secrets como GOOGLE_SERVICE_ACCOUNT.")
         st.stop()
     sa = st.secrets["GOOGLE_SERVICE_ACCOUNT"]
-    # st.secrets já traz um dict se você colou o JSON no secrets, ou uma string; trate ambos
+    import json
     if isinstance(sa, str):
-        import json
         sa_info = json.loads(sa)
     else:
         sa_info = sa
     creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
     return creds
 
-# ---------- Drive / Sheets helpers ----------
 def build_drive_service(creds):
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def build_sheets_client(creds):
-    # usar gspread authorize
     return authorize(creds)
 
-def download_drive_file(service, file_id, dest_path):
-    # obtém metadados
+# ---------- Drive helpers ----------
+def list_files_in_folder(service, folder_id, page_size=1000):
+    """
+    Lista arquivos em uma pasta Drive. Retorna lista de dicts {id, name, mimeType, modifiedTime}
+    """
+    files = []
+    q = f"'{folder_id}' in parents and trashed=false"
+    page_token = None
+    while True:
+        resp = service.files().list(q=q,
+                                    spaces='drive',
+                                    fields="nextPageToken, files(id, name, mimeType, modifiedTime, size)",
+                                    pageToken=page_token,
+                                    pageSize=page_size).execute()
+        files.extend(resp.get("files", []))
+        page_token = resp.get('nextPageToken', None)
+        if not page_token:
+            break
+    return files
+
+def download_drive_file(service, file_id, dest_path, mime=None):
+    # Se for Google Docs (document) precisamos usar export; aqui detectamos pelo mime se passado
     meta = service.files().get(fileId=file_id, fields="id,name,mimeType").execute()
     mime = meta.get("mimeType")
     name = meta.get("name")
-    # se for Google Docs, exportar para text/plain ou docx
     if mime == "application/vnd.google-apps.document":
         request = service.files().export_media(fileId=file_id, mimeType="text/plain")
         fh = io.BytesIO()
@@ -104,9 +107,9 @@ def extract_text_from_pdf(path):
     try:
         with pdfplumber.open(path) as pdf:
             for p in pdf.pages:
-                page_text = p.extract_text()
-                if page_text:
-                    text += page_text + "\n"
+                pt = p.extract_text()
+                if pt:
+                    text += pt + "\n"
     except Exception as e:
         st.warning(f"pdfplumber falhou: {e}")
     return text
@@ -114,89 +117,70 @@ def extract_text_from_pdf(path):
 def extract_text_via_ocr(path):
     text = ""
     try:
-        # converte cada página/image em texto
-        # tentamos abrir com PIL — funciona para imagens; se for PDF tentaremos com pdfplumber para imagens das páginas
         if path.lower().endswith(".pdf"):
-            try:
-                with pdfplumber.open(path) as pdf:
-                    for p in pdf.pages:
-                        im = p.to_image(resolution=200).original
-                        txt = pytesseract.image_to_string(im, lang='por+eng')
-                        text += txt + "\n"
-            except Exception as e:
-                st.warning(f"OCR via pdf->imagem falhou: {e}")
+            with pdfplumber.open(path) as pdf:
+                for p in pdf.pages:
+                    im = p.to_image(resolution=200).original
+                    txt = pytesseract.image_to_string(im, lang='por+eng')
+                    text += txt + "\n"
         else:
             im = Image.open(path)
-            text = pytesseract.image_to_string(im, lang='por+eng')
+            txt = pytesseract.image_to_string(im, lang='por+eng')
+            text += txt
     except Exception as e:
-        st.error(f"OCR falhou: {e}")
+        st.warning(f"OCR falhou: {e}")
     return text
 
-# ---------- Parsers para campos brasileiros ----------
-# CNPJ: 14 dígitos (com ou sem pontuação)
-CNPJ_RE = re.compile(r"(?:CNPJ[:\\s]*|C\.?NPJ[:\\s]*|CNPJ\\s*)?([0-9]{2}[\\.\\/-]?[0-9]{3}[\\.\\/-]?[0-9]{3}[\\/\\-]?[0-9]{4}[\\-]?[0-9]{2})")
-CPF_RE = re.compile(r"(?:CPF[:\\s]*|CPF\\s*)?([0-9]{3}[\\.\\/-]?[0-9]{3}[\\.\\/-]?[0-9]{3}[\\-]?[0-9]{2})")
-# valor total: procura por R$ 1.234,56 ou 1234.56 / 1234,56
-VAL_RE = re.compile(r"R\\$\\s*[0-9\\.,]+|[0-9]{1,3}(?:[\\.\\,][0-9]{3})*(?:[\\.,][0-9]{2})")
-# data: dd/mm/yyyy ou yyyy-mm-dd
-DATE_RE = re.compile(r"([0-3]?[0-9][/\\-][0-1]?[0-9][/\\-][0-9]{2,4}|[0-9]{4}-[0-9]{2}-[0-9]{2})")
-# numero nota: procura por 'NF', 'Nº', 'Nº nota', 'Nota Fiscal' seguido de números
-NF_RE = re.compile(r"(?:N(?:\\.|º|o)?\\s*F(?:iscal)?[:\\s]*|Nota\\s+Fiscal[:\\s]*|N[:º\\s]*)([0-9\\-\\/\\.]+)")
+# ---------- Parsers ----------
+CNPJ_RE = re.compile(r"(?:CNPJ[:\s]*|C\.?NPJ[:\s]*|CNPJ\s*)?([0-9]{2}[\.\/-]?[0-9]{3}[\.\/-]?[0-9]{3}[\/-]?[0-9]{4}[-]?[0-9]{2})")
+CPF_RE = re.compile(r"(?:CPF[:\s]*|CPF\s*)?([0-9]{3}[\.\/-]?[0-9]{3}[\.\/-]?[0-9]{3}[-]?[0-9]{2})")
+VAL_RE = re.compile(r"R\$\s*[0-9\.,]+|[0-9]{1,3}(?:[\.][0-9]{3})*(?:[\,][0-9]{2})|[0-9]+[\,\.][0-9]{2}")
+DATE_RE = re.compile(r"([0-3]?[0-9][\/\-][0-1]?[0-9][\/\-][0-9]{2,4}|[0-9]{4}-[0-9]{2}-[0-9]{2})")
+NF_RE = re.compile(r"(?:N(?:\.|º|o)?\s*F(?:iscal)?[:\s]*|Nota\s+Fiscal[:\s]*|N[:º\s]*)([0-9\-/\.]+)")
 
 def normalize_money(s):
     if not s:
         return None
     s = s.strip()
-    # remove R$
-    s = re.sub(r"[Rr]\\$\\s*", "", s)
-    # if has comma as decimal separator and dot as thousand, handle
+    s = re.sub(r"[Rr]\$\s*", "", s)
     s = s.replace(".", "").replace(",", ".")
-    try:
-        return float(re.findall(r"[0-9]+(?:\\.[0-9]+)?", s)[0])
-    except Exception:
-        return None
+    m = re.findall(r"[0-9]+(?:\.[0-9]+)?", s)
+    if m:
+        try:
+            return float(m[0])
+        except:
+            return None
+    return None
 
 def extract_fields_from_text(text):
-    # tenta extrair os campos solicitados
     out = {}
-    # CNPJ
     m = CNPJ_RE.search(text)
     out["cnpj"] = m.group(1) if m else None
-    # CPF
     m = CPF_RE.search(text)
     out["cpf"] = m.group(1) if m else None
-    # Datas (pega a primeira)
     m = DATE_RE.search(text)
     out["data_compra"] = m.group(1) if m else None
-    # Numero NF
     m = NF_RE.search(text)
     out["numero_nota"] = m.group(1) if m else None
-    # Valor total: tentamos localizar palavras-chaves próximas a Tot(al)
     total = None
-    # procura ocorrências de palavras semelhantes
-    for keyword in ["valor total", "total da nota", "total", "valor da nota", "valor liquido", "valor bruto", "total geral"]:
+    for keyword in ["valor total", "total da nota", "total", "valor da nota", "total geral"]:
         idx = text.lower().find(keyword)
         if idx != -1:
-            # pega trecho a direita
             snippet = text[idx: idx + 150]
             mval = VAL_RE.search(snippet)
             if mval:
                 total = normalize_money(mval.group(0))
                 break
-    # fallback: primeiro valor grande encontrado
     if total is None:
         all_vals = VAL_RE.findall(text)
         if all_vals:
-            # normalize and pick the largest numeric (heurística)
             nums = [(v, normalize_money(v)) for v in all_vals]
             nums_parsed = [t for t in nums if t[1] is not None]
             if nums_parsed:
                 total = max(nums_parsed, key=lambda x: x[1])[1]
     out["valor_total"] = total
-    # Nome da empresa: heurística -> linha acima do CNPJ ou primeira LINE com palavra 'Ltd','LTDA','EIRELI','ME','MEI' ou caixa alta
     company = None
     if out["cnpj"]:
-        # procurar linha que contenha o cnpj e pegar a linha anterior
         lines = text.splitlines()
         for i,l in enumerate(lines):
             if out["cnpj"] in l:
@@ -204,20 +188,17 @@ def extract_fields_from_text(text):
                     company = lines[i-1].strip()
                 break
     if not company:
-        # procurar padrões de razão social
-        for keyword in ["LTDA", "Ltda", "MEI", "EIRELI", "S\\.A\\.", "SA", "S A", "S\\.A"]:
+        for keyword in ["LTDA", "Ltda", "MEI", "EIRELI", "S.A.", "SA", "S A"]:
             m = re.search(r".{2,80}"+keyword+r".{0,40}", text)
             if m:
                 company = m.group(0).strip()
                 break
     if not company:
-        # fallback: primeira linha longa (provável cabeçalho)
         for l in text.splitlines():
-            if len(l.strip())>4 and len(l.strip())<120 and l.strip()==l.strip().upper():
+            if len(l.strip())>4 and l.strip()==l.strip().upper():
                 company = l.strip()
                 break
     out["empresa"] = company
-    # Endereço: heurística: procurar 'Endereço' ou trecho com 'Rua','Av','Avenida','Logradouro' dentro de linhas próximas ao CNPJ ou nome
     address = None
     for keyword in ["Endereço","Endereço:", "Rua ", "R. ", "Av ", "Avenida", "Logradouro"]:
         idx = text.find(keyword)
@@ -226,82 +207,105 @@ def extract_fields_from_text(text):
             address = snippet.replace("Endereço:", "").strip()
             break
     out["endereco"] = address
-    # Descrição de itens com valores: tentativa de extrair blocos com padrão 'produto - R$ valor' ou linhas com 'x R$'
-    items = []
+    items=[]
     for line in text.splitlines():
-        if re.search(r"R\\$|\\d+,\\d{2}|\\d+\\.\\d{2}", line):
-            # heurística: linha que contém valor e alguma descrição (palavras)
-            if len(line.strip())>5 and (len(re.sub(r"[0-9\\W]", "", line))>0):
+        if re.search(r"R\$|\d+,\d{2}|\d+\.\d{2}", line):
+            if len(line.strip())>5 and (len(re.sub(r"[0-9\W]","",line))>0):
                 items.append(line.strip())
-    out["itens_descricoes"] = "\\n".join(items[:20]) if items else None
+    out["itens_descricoes"] = "\n".join(items[:40]) if items else None
     return out
 
-# ---------- UI ----------
-st.sidebar.header("Configuração")
-st.sidebar.markdown(
-    """
-    1. Coloque o JSON da Service Account em **Settings → Secrets** do Streamlit como `GOOGLE_SERVICE_ACCOUNT`.
-    2. Forneça o ID do arquivo do Google Drive e o ID da planilha do Google Sheets.
-    """
-)
+# ---------- UI inputs ----------
+st.sidebar.header("Parâmetros")
+drive_folder_id = st.sidebar.text_input("ID da pasta no Google Drive (folderId)")
+spreadsheet_id = st.sidebar.text_input("ID do Google Sheets (spreadsheetId)")
+sheet_tab = st.sidebar.text_input("Nome da aba para dados", value="NF_Import")
+processed_tab = st.sidebar.text_input("Aba para arquivos processados", value="Processed_Files")
 
-st.sidebar.markdown("**Entradas**")
-file_id = st.sidebar.text_input("ID do arquivo no Google Drive (fileId)")
-sheet_id = st.sidebar.text_input("ID do Google Sheets (spreadsheetId)")
-sheet_tab = st.sidebar.text_input("Nome da guia (aba) para inserir os dados", value="NF_Import")
+st.sidebar.markdown("Depois de preencher, clique em 'Verificar nova(s) NF(s)'")
 
-if st.sidebar.button("Rodar extração"):
-    if not file_id or not sheet_id:
-        st.error("Forneça fileId do Drive e spreadsheetId do Sheets na barra lateral.")
-    else:
-        creds = get_google_creds()
-        drive = build_drive_service(creds)
-        gs_client = build_sheets_client(creds)
+# ---------- Main processing ----------
+if st.sidebar.button("Verificar nova(s) NF(s)"):
+    if not drive_folder_id or not spreadsheet_id:
+        st.error("Forneça folderId do Drive e spreadsheetId do Sheets.")
+        st.stop()
 
-        with st.spinner("Baixando arquivo do Drive..."):
-            tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
-            path, mime = download_drive_file(drive, file_id, tmpf.name)
+    creds = get_google_creds()
+    drive = build_drive_service(creds)
+    gs_client = build_sheets_client(creds)
+
+    with st.spinner("Listando arquivos na pasta..."):
+        files = list_files_in_folder(drive, drive_folder_id)
+    st.success(f"{len(files)} arquivo(s) encontrados na pasta.")
+
+    # abrir planilha e carregar abas necessárias
+    try:
+        sh = gs_client.open_by_key(spreadsheet_id)
+    except Exception as e:
+        st.error(f"Erro ao abrir planilha: {e}")
+        st.stop()
+
+    # garantir a aba NF_Import
+    try:
+        ws_data = sh.worksheet(sheet_tab)
+    except Exception:
+        ws_data = sh.add_worksheet(title=sheet_tab, rows="1000", cols="30")
+
+    # garantir a aba Processed_Files
+    try:
+        ws_proc = sh.worksheet(processed_tab)
+    except Exception:
+        ws_proc = sh.add_worksheet(title=processed_tab, rows="1000", cols="10")
+
+    # ler processados
+    proc_df = pd.DataFrame(ws_proc.get_all_records()) if ws_proc.get_all_records() else pd.DataFrame(columns=["fileId","name","mimeType","processed_at","modifiedTime"])
+    processed_ids = set(proc_df["fileId"].astype(str).tolist()) if not proc_df.empty else set()
+
+    # identificar novos
+    new_files = [f for f in files if str(f.get("id")) not in processed_ids]
+    st.write(f"Novos arquivos a processar: {len(new_files)}")
+
+    results_rows = []
+    processed_rows = []
+
+    for f in new_files:
+        fid = f.get("id")
+        name = f.get("name")
+        mime = f.get("mimeType")
+        modified = f.get("modifiedTime", "")
+        st.write(f"Processando: {name} ({fid}) — {mime}")
+        tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
+        try:
+            path, actual_mime = download_drive_file(drive, fid, tmpf.name)
             tmpf.close()
-            st.success(f"Arquivo baixado: {os.path.basename(path)} (mime: {mime})")
-
-        # detect mime local se necessário
-        kind = magic.from_file(path, mime=True)
-        st.write(f"Detecção MIME local: {kind}")
-
-        extracted = ""
-        # se for texto (exportado google doc) ou txt
-        if path.lower().endswith(".txt") or mime=="text/plain":
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                extracted = f.read()
-        elif path.lower().endswith(".pdf") or "pdf" in kind:
-            st.info("Tentando extrair texto do PDF com pdfplumber...")
-            extracted = extract_text_from_pdf(path)
-            if not extracted or len(extracted.strip())<30:
-                st.info("Pouco texto extraído — tentando OCR (pytesseract).")
+            kind = magic.from_file(path, mime=True)
+            st.write(f"Download OK. MIME detectado: {kind}")
+            extracted = ""
+            if path.lower().endswith(".txt") or actual_mime=="text/plain":
+                with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                    extracted = fh.read()
+            elif path.lower().endswith(".pdf") or "pdf" in kind:
+                extracted = extract_text_from_pdf(path)
+                if not extracted or len(extracted.strip())<30:
+                    st.info("PDF com pouco texto — tentando OCR.")
+                    extracted = extract_text_via_ocr(path)
+            else:
                 extracted = extract_text_via_ocr(path)
-        else:
-            # tentar abrir como imagem
-            try:
-                st.info("Tentando OCR de imagem...")
-                extracted = extract_text_via_ocr(path)
-            except Exception as e:
-                st.error(f"Não foi possível extrair texto do arquivo: {e}")
 
-        if not extracted or len(extracted.strip())==0:
-            st.error("Nenhum texto extraído do arquivo. Verifique se o arquivo é pesquisável ou use OCR/Google Vision.")
-        else:
-            st.subheader("Trecho extraído (pré-visualização)")
-            st.text_area("Texto extraído (role)", value=extracted[:4000], height=250)
+            if not extracted or len(extracted.strip())==0:
+                st.warning(f"Nenhum texto extraído do arquivo {name}. Pulei.")
+                # registrar mesmo assim como processado para evitar loop (opcional)
+                processed_rows.append({
+                    "fileId": fid, "name": name, "mimeType": mime, "processed_at": datetime.now().isoformat(), "modifiedTime": modified, "note": "no_text_extracted"
+                })
+                continue
 
-            st.info("Analisando texto e extraindo campos...")
             fields = extract_fields_from_text(extracted)
-
-            st.write("Campos extraídos (heurísticos):")
-            st.json(fields)
-
-            # preparar linha / DataFrame para inserir na planilha
             row = {
                 "timestamp_import": datetime.now().isoformat(),
+                "drive_file_id": fid,
+                "file_name": name,
+                "drive_mime": mime,
                 "empresa": fields.get("empresa"),
                 "cnpj": fields.get("cnpj"),
                 "descricao_itens": fields.get("itens_descricoes"),
@@ -309,47 +313,80 @@ if st.sidebar.button("Rodar extração"):
                 "valor_total": fields.get("valor_total"),
                 "numero_nota": fields.get("numero_nota"),
                 "cpf": fields.get("cpf"),
-                "endereco": fields.get("endereco"),
-                "drive_file_id": file_id,
-                "drive_mime": mime
+                "endereco": fields.get("endereco")
             }
-            df = pd.DataFrame([row])
+            results_rows.append(row)
+            processed_rows.append({
+                "fileId": fid, "name": name, "mimeType": mime, "processed_at": datetime.now().isoformat(), "modifiedTime": modified, "note": "processed_ok"
+            })
+            st.success(f"Processado: {name}")
 
-            st.subheader("Linha a ser gravada no Google Sheets")
-            st.dataframe(df)
+        except Exception as e:
+            st.error(f"Erro ao processar {name}: {e}")
+            processed_rows.append({
+                "fileId": fid, "name": name, "mimeType": mime, "processed_at": datetime.now().isoformat(), "modifiedTime": modified, "note": f"error: {e}"
+            })
+        finally:
+            try:
+                os.unlink(tmpf.name)
+            except:
+                pass
 
-            # confirmar gravação
-            if st.button("Gravar no Google Sheets"):
-                try:
-                    sh = gs_client.open_by_key(sheet_id)
-                except Exception as e:
-                    st.error(f"Erro ao abrir planilha: {e}")
-                    st.stop()
-                # criar aba se não existir
-                try:
-                    worksheet = None
-                    try:
-                        worksheet = sh.worksheet(sheet_tab)
-                    except Exception:
-                        worksheet = sh.add_worksheet(title=sheet_tab, rows="100", cols="20")
-                    # ler existente e anexar
-                    existing = pd.DataFrame(worksheet.get_all_records())
-                    if existing.empty:
-                        set_with_dataframe(worksheet, df, include_index=False, include_column_header=True)
-                    else:
-                        new_df = pd.concat([existing, df], ignore_index=True)
-                        set_with_dataframe(worksheet, new_df, include_index=False, include_column_header=True)
-                    st.success("Gravado com sucesso no Google Sheets.")
-                except Exception as e:
-                    st.error(f"Erro ao gravar no Google Sheets: {e}")
+    # gravar resultados na aba NF_Import
+    if results_rows:
+        try:
+            existing_data = pd.DataFrame(ws_data.get_all_records()) if ws_data.get_all_records() else pd.DataFrame()
+            new_data_df = pd.DataFrame(results_rows)
+            if existing_data.empty:
+                set_with_dataframe(ws_data, new_data_df, include_index=False, include_column_header=True)
+            else:
+                combined = pd.concat([existing_data, new_data_df], ignore_index=True)
+                set_with_dataframe(ws_data, combined, include_index=False, include_column_header=True)
+            st.success(f"{len(results_rows)} linha(s) gravadas em '{sheet_tab}'.")
+        except Exception as e:
+            st.error(f"Erro ao gravar dados: {e}")
+
+    # gravar Processed_Files
+    if processed_rows:
+        try:
+            existing_proc = pd.DataFrame(ws_proc.get_all_records()) if ws_proc.get_all_records() else pd.DataFrame()
+            new_proc_df = pd.DataFrame(processed_rows)
+            if existing_proc.empty:
+                set_with_dataframe(ws_proc, new_proc_df, include_index=False, include_column_header=True)
+            else:
+                # evitar duplicatas: concat e drop_duplicates por fileId mantendo última ocorrência
+                combined_proc = pd.concat([existing_proc, new_proc_df], ignore_index=True)
+                combined_proc = combined_proc.sort_values("processed_at").drop_duplicates(subset=["fileId"], keep="last")
+                set_with_dataframe(ws_proc, combined_proc, include_index=False, include_column_header=True)
+            st.success(f"{len(processed_rows)} arquivo(s) marcados como processados.")
+        except Exception as e:
+            st.error(f"Erro ao gravar Processed_Files: {e}")
+
+    # mostrar resumo
+    st.subheader("Resumo de execução")
+    st.write(f"Arquivos encontrados: {len(files)}")
+    st.write(f"Novos processados: {len(results_rows)} (gravados em '{sheet_tab}')")
+    st.write(f"Arquivos marcados processados: {len(processed_rows)} (gravados em '{processed_tab}')")
+
+    # exibir primeiras linhas gravadas
+    if results_rows:
+        st.subheader("Amostra dos dados gravados")
+        st.dataframe(pd.DataFrame(results_rows).head(20))
+
+    if processed_rows:
+        st.subheader("Amostra dos arquivos marcados como processados")
+        st.dataframe(pd.DataFrame(processed_rows).head(20))
 
 st.markdown("---")
-st.markdown("### Validação / Observações importantes")
+st.markdown("**Notas / recomendações**")
 st.markdown(
     """
-    - O parser usa heurísticas — para documentos muito diferentes (layout diverso, PDF escaneado), os campos podem exigir regras específicas.
-    - Para OCR confiável em PDFs escaneados recomendamos usar **Google Vision API** (melhor taxa de acerto), o que exigirá um conjunto de credenciais GCP adicionais.
-    - Se for usar `pytesseract`, o binário **Tesseract** deve estar instalado no servidor (no Streamlit Cloud pode não estar presente por padrão).
-    - Guardamos apenas o `fileId` no registro — o arquivo original permanece no seu Drive.
+    - A Service Account precisa ser *Viewer* na pasta (ou nos arquivos) e *Editor* na planilha.
+    - O app registra os `fileId` processados na aba `Processed_Files` para não reprocessar.
+    - Para arquivos escaneados, OCR depende do binário Tesseract disponível no ambiente.
+    - Podemos adaptar para:
+        * Processar somente arquivos com extensão específica (.pdf, .docx, .xml)
+        * Rodar em lote (bulk) e enviar relatório por e-mail
+        * Usar Google Vision API se precisar de OCR de alta qualidade
     """
 )
