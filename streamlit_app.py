@@ -134,8 +134,11 @@ def extract_text_via_ocr(path):
 CNPJ_RE = re.compile(r"(?:CNPJ[:\s]|C.?NPJ[:\s]|CNPJ\s*)?([0-9]{2}[./-]?[0-9]{3}[./-]?[0-9]{3}[/-]?[0-9]{4}[-]?[0-9]{2})")
 CPF_RE = re.compile(r"(?:CPF[:\s]|CPF\s)?([0-9]{3}[./-]?[0-9]{3}[./-]?[0-9]{3}[-]?[0-9]{2})")
 VAL_RE = re.compile(r"R\$?\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+,\d{2})") # CORRIGIDO: Escapado o ponto
-DATE_RE = re.compile(r"([0-3]?[0-9][/-][0-1]?[0-9][/-][0-9]{2,4}|[0-9]{4}-[0-9]{2}-[0-9]{2})")
+# Melhorando DATE_RE para capturar formatos como DD/MM/AAAA, DD/MM/AA, AAAA-MM-DD e DD/MM/YYYY HH:MM
+DATE_RE = re.compile(r"(?:DATA(?:\s*DE\s*EMISSÃO)?[:\s]*)?(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}(?:\s+\d{1,2}:\d{1,2}(?::\d{1,2})?)?|\d{4}-\d{1,2}-\d{1,2})")
+
 NF_RE = re.compile(r"(?:N(?:.|º|o)?\sF(?:iscal)?[:\s]|Nota\s+Fiscal[:\s]|N[:º\s]|SAT\sNo.?\s|\sNFC-e\s|\sNF-e\s|Nr\s+Documento[:\s]*)([0-9-/.]+)")
+
 
 def normalize_money(s):
     if not s:
@@ -165,17 +168,42 @@ def extract_fields_from_text(text):
     out["cpf"] = m.group(1) if m else None
     if out["cpf"]: st.write(f"CPF encontrado: {out['cpf']}")
 
-    # Extrair Data de Compra
-    m = DATE_RE.search(text)
-    out["data_compra"] = m.group(1) if m else None
+    # Extrair Data de Compra - Aprimorando a busca
+    out["data_compra"] = None
+    # Priorizar buscas com palavras-chave
+    date_keywords = ["DATA DE EMISSÃO", "EMISSÃO", "DATA/HORA", "DATA"]
+    for kw in date_keywords:
+        idx = text.upper().find(kw)
+        if idx != -1:
+            snippet = text[idx:idx + 50] # Pega um snippet após a palavra-chave
+            m = DATE_RE.search(snippet)
+            if m:
+                out["data_compra"] = m.group(1)
+                break
+    # Se não encontrou por palavra-chave, tenta no texto todo
+    if not out["data_compra"]:
+        m = DATE_RE.search(text)
+        out["data_compra"] = m.group(1) if m else None
+
     if out["data_compra"]: st.write(f"Data de Compra encontrada: {out['data_compra']}")
 
-    # Extrair Número da Nota
-    m = NF_RE.search(text)
-    out["numero_nota"] = m.group(1) if m else None
+    # Extrair Número da Nota - Aprimorando a busca
+    out["numero_nota"] = None
+    nf_keywords = ["NÚMERO:", "NÚMERO DA NOTA", "NOTA FISCAL Nº", "SAT NO.", "Nr Documento"]
+    for kw in nf_keywords:
+        idx = text.upper().find(kw)
+        if idx != -1:
+            snippet = text[idx:idx + 50]
+            m = NF_RE.search(snippet)
+            if m:
+                out["numero_nota"] = m.group(1)
+                break
+    if not out["numero_nota"]:
+        m = NF_RE.search(text)
+        out["numero_nota"] = m.group(1) if m else None
     if out["numero_nota"]: st.write(f"Número da Nota encontrado: {out['numero_nota']}")
 
-    # Extrair Valor Total
+    # Extrair Valor Total - Lógica existing está boa, mas garatindo que 'VAL_RE' está correto
     total = None
     for keyword in ["valor total", "total da nota", "total", "valor da nota", "total geral", "valor a pagar"]:
         idx = text.lower().find(keyword)
@@ -195,80 +223,126 @@ def extract_fields_from_text(text):
     out["valor_total"] = total
     if out["valor_total"]: st.write(f"Valor Total encontrado: {out['valor_total']}")
 
-    # Extrair Empresa (Razão Social) - Lógica aprimorada
+    # Extrair Empresa (Razão Social) - Aprimorando a lógica
     company = None
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
+    # Tenta encontrar antes do CNPJ ou com palavras-chave mais fortes no início
     if lines:
         m_cnpj = CNPJ_RE.search(text)
         if m_cnpj:
             cnpj_pos = m_cnpj.start()
-            text_before_cnpj = text[:cnpj_pos].splitlines()
-            text_before_cnpj = [l.strip() for l in text_before_cnpj if l.strip()]
+            text_before_cnpj_raw = text[:cnpj_pos]
+            text_before_cnpj_lines = [l.strip() for l in text_before_cnpj_raw.splitlines() if l.strip()]
 
-            if text_before_cnpj:
-                candidate_company_line = text_before_cnpj[-1]
-                if candidate_company_line.isupper() and len(candidate_company_line) > 5 and not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+', candidate_company_line):
-                    company = candidate_company_line
-                elif len(text_before_cnpj) > 1:
-                    candidate_company_line = text_before_cnpj[-2]
-                    if candidate_company_line.isupper() and len(candidate_company_line) > 5 and not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+', candidate_company_line):
+            if text_before_cnpj_lines:
+                # Prioriza as 2 últimas linhas antes do CNPJ
+                for i in range(len(text_before_cnpj_lines) -1, max(-1, len(text_before_cnpj_lines) - 3), -1):
+                    candidate_company_line = text_before_cnpj_lines[i]
+                    # Heurística: linha com mais de 5 caracteres, predominantemente maiúscula, sem muitas datas/valores/endereços
+                    if len(candidate_company_line) > 5 and \
+                       (candidate_company_line.isupper() or sum(1 for c in candidate_company_line if c.isupper()) / len(candidate_company_line) > 0.7) and \
+                       not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+|RUA|AVENIDA|BAIRRO|CEP', candidate_company_line.upper()):
                         company = candidate_company_line
+                        break
+                if company:
+                    st.write(f"Empresa encontrada (pré-CNPJ): {company}")
 
+        # Se não encontrou antes do CNPJ, procura por palavras-chave no início do documento
         if not company:
             search_area = "\n".join(lines[:10])
-            company_keywords = ["LTDA", "MEI", "EIRELI", "S.A.", "SA", "S A", "COMERCIO", "SERVICOS", "MATERIAIS"]
+            company_keywords = ["LTDA", "MEI", "EIRELI", "S.A.", "SA", "COMERCIO", "SERVICOS", "MATERIAIS", "INDUSTRIA"]
             for keyword in company_keywords:
                 for l in search_area.splitlines():
-                    if keyword in l.upper() and len(l) > 10:
+                    if keyword in l.upper() and len(l) > 10 and \
+                       not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+|RUA|AVENIDA|BAIRRO|CEP', l.upper()): # Evitar endereços
                         company = l.strip()
                         break
                 if company:
                     break
-
+        
+        # Último recurso: a primeira linha significativa em maiúsculas (no topo)
         if not company and lines:
             for l in lines[:5]:
-                if l.isupper() and len(l) > 10 and not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+', l):
+                if l.isupper() and len(l) > 10 and not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+|RUA|AVENIDA|BAIRRO|CEP', l.upper()):
                     company = l
                     break
 
     out["empresa"] = company
     if out["empresa"]: st.write(f"Empresa encontrada: {out['empresa']}")
 
-    # Extrair Endereço
+    # Extrair Endereço - Aprimorando a lógica para capturar múltiplas linhas
     address = None
-    address_keywords = ["Endereço", "Endereço:", "Rua ", "R. ", "Av ", "Avenida", "Logradouro", "BAIRRO", "CIDADE", "CEP"]
+    address_keywords = ["ENDEREÇO", "ENDEREÇO:", "RUA ", "R. ", "AV ", "AVENIDA", "LOGRADOURO", "BAIRRO", "CIDADE", "CEP"]
+    
+    # Busca por palavras-chave e tenta capturar blocos de texto
     for keyword in address_keywords:
-        idx = text.find(keyword)
+        idx = text.upper().find(keyword)
         if idx != -1:
-            snippet = text[idx: idx + 200]
-            address_lines = snippet.splitlines()
-            if address_lines:
-                potential_address_lines = []
-                for al in address_lines[:5]:
-                    if any(sub_keyword in al for sub_keyword in ["Rua", "Av", "Bairro", "CEP", "Cidade", "Numero", "Nº", ","]) and len(al) > 10:
-                        potential_address_lines.append(al.strip())
-                
-                if potential_address_lines:
-                    address = " ".join(potential_address_lines)
-            if address:
+            # Pega um snippet maior após a palavra-chave
+            snippet_raw = text[idx: idx + 300]
+            snippet_lines = [l.strip() for l in snippet_raw.splitlines() if l.strip()]
+
+            potential_address_parts = []
+            # Procura por linhas que contenham indicadores de endereço
+            for al in snippet_lines[:7]: # Limita a busca às próximas 7 linhas
+                if (any(sub_keyword in al.upper() for sub_keyword in ["RUA", "AV", "BAIRRO", "CEP", "CIDADE", "NUMERO", "Nº", ",", "EDF", "APTO"]) and 
+                    len(al) > 5 and # Linha minimamente longa
+                    not re.search(r'CNPJ|CPF|INSCRIÇÃO|IE|TELEFONE|CELULAR|E-MAIL|HTTP', al.upper())): # Evita outras informações
+                    potential_address_parts.append(al)
+                elif len(potential_address_parts) > 0 and len(al) > 5 and not re.search(r'CNPJ|CPF|INSCRIÇÃO|IE|TELEFONE|CELULAR|E-MAIL|HTTP', al.upper()):
+                    # Se já encontrou partes de endereço, inclui linhas subsequentes que pareçam continuar o endereço
+                    potential_address_parts.append(al)
+                else:
+                    # Quebra se a linha não for um endereço e não for uma continuação
+                    if len(potential_address_parts) > 0: # Se já pegou algo, pare de buscar
+                        break
+
+            if potential_address_parts:
+                address = " ".join(potential_address_parts)
                 break
     out["endereco"] = address
     if out["endereco"]: st.write(f"Endereço encontrado: {out['endereco']}")
 
     # Extrair Descrição de Itens - Lógica aprimorada
     items=[]
+    # Palavras-chave para ignorar linhas que não são itens de descrição (mais abrangente)
     ignore_keywords_items = ["SUBTOTAL", "TOTAL", "IMPOSTOS", "ICMS", "ISS", "DESCONTO", 
                              "FORMA DE PAGAMENTO", "TROCO", "CRÉDITO", "DÉBITO", "DINHEIRO", 
                              "VALOR", "CPF DO CONSUMIDOR", "CNPJ", "IE", "CUPOM FISCAL", 
-                             "SAT NO", "NOTA FISCAL", "LANÇAMENTO", "DATA"]
+                             "SAT NO", "NOTA FISCAL", "LANÇAMENTO", "DATA", "CÓDIGO", 
+                             "UNIDADE", "QTD", "PRODUTO", "DESCRIÇÃO", "VALOR UNITÁRIO", 
+                             "VALOR TOTAL"]
+    
+    # Marcadores de início e fim da seção de itens (para melhor delimitação)
+    start_keywords = ["ITENS", "DESCRIÇÃO", "PRODUTOS E SERVIÇOS", "DETALHES DA VENDA", "CUPOM FISCAL", "NOTA FISCAL"]
+    end_keywords = ["VALOR TOTAL", "SUBTOTAL", "TOTAL A PAGAR", "FORMAS DE PAGAMENTO", "OBSERVAÇÕES"]
 
+    in_items_section = False
+    
     for line in text.splitlines():
         line_clean = line.strip()
-        if re.search(r"\d+,\d{2}|\d+\.\d{2}", line_clean):
-            if len(line_clean) > 5 and re.search(r"[a-zA-Z]", line_clean):
-                if not any(keyword in line_clean.upper() for keyword in ignore_keywords_items):
+        line_upper = line_clean.upper()
+
+        if not in_items_section:
+            if any(kw in line_upper for kw in start_keywords) and len(line_clean) < 50: # Evitar capturar linhas muito longas como "start"
+                in_items_section = True
+                continue
+        
+        if in_items_section:
+            if any(kw in line_upper for kw in end_keywords):
+                break # Sai da seção de itens
+
+            # Verifica se contém padrão de dinheiro/número (ex: "10,00" ou "10.00")
+            # e também procura por um número de quantidade no início (ex: "1 X", "2 UN")
+            # Ou se parece uma descrição de produto (letras e números)
+            if (re.search(r"\d+,\d{2}|\d+\.\d{2}", line_clean) and re.search(r"[a-zA-Z]", line_clean) and len(line_clean) > 5) or \
+               (re.search(r"^\d+\s*(?:X|UN|QTDE)\s*", line_upper) and len(line_clean) > 5):
+                
+                # Verifica se a linha NÃO contém palavras-chave de ignorar (case-insensitive)
+                if not any(keyword in line_upper for keyword in ignore_keywords_items):
                     items.append(line_clean)
+                    
     out["itens_descricoes"] = "\n".join(items[:40]) if items else None
     if out["itens_descricoes"]: st.write(f"Itens encontrados:\n{out['itens_descricoes']}")
 
@@ -287,7 +361,44 @@ processed_tab = st.sidebar.text_input("Aba para arquivos processados", value=st.
 reprocess_all = st.sidebar.checkbox("Reprocessar todos os arquivos?", value=False)
 
 button_label = "Processar Todos os Arquivos" if reprocess_all else "Verificar nova(s) NF(s)"
-st.sidebar.markdown("Depois de preencher, clique no botão para iniciar.")
+st.sidebar.markdown("---")
+st.sidebar.markdown("Opções de processamento:")
+
+# Botão para limpar a planilha
+if st.sidebar.button("🚨 Limpar Dados da Planilha"):
+    if not spreadsheet_id:
+        st.error("Forneça o spreadsheetId do Sheets antes de tentar limpar.")
+    else:
+        confirm_clear = st.sidebar.checkbox("Confirmar limpeza? (Irreversível!)")
+        if confirm_clear:
+            try:
+                gs_client = build_sheets_client(creds_check)
+                sh = gs_client.open_by_key(spreadsheet_id)
+                
+                # Limpa a aba de dados
+                ws_data = sh.worksheet(sheet_tab)
+                ws_data.clear()
+                # Recria o cabeçalho
+                initial_columns = ["timestamp_import", "drive_file_id", "file_name", "drive_mime", "empresa", "cnpj", "descricao_itens", "data_compra", "valor_total", "numero_nota", "cpf", "endereco"]
+                ws_data.append_row(initial_columns)
+                st.success(f"Aba '{sheet_tab}' limpa e cabeçalho restaurado.")
+                
+                # Limpa a aba de arquivos processados
+                ws_proc = sh.worksheet(processed_tab)
+                ws_proc.clear()
+                # Recria o cabeçalho
+                initial_proc_columns = ["fileId","name","mimeType","processed_at","modifiedTime", "note"]
+                ws_proc.append_row(initial_proc_columns)
+                st.success(f"Aba '{processed_tab}' limpa e cabeçalho restaurado.")
+                st.warning("É necessário recarregar a página ou desmarcar 'Confirmar limpeza?' para continuar.")
+                st.stop() # Interrompe a execução para evitar reprocessamento imediato
+            except Exception as e:
+                st.error(f"Erro ao limpar planilha: {e}")
+        else:
+            st.info("Marque a caixa de confirmação para limpar a planilha.")
+            
+st.sidebar.markdown("---")
+st.sidebar.markdown("Clique no botão abaixo para iniciar:")
 
 # ---------- Main processing ----------
 if st.sidebar.button(button_label):
@@ -315,16 +426,24 @@ if st.sidebar.button(button_label):
         ws_data = sh.worksheet(sheet_tab)
     except Exception:
         ws_data = sh.add_worksheet(title=sheet_tab, rows="1000", cols="30")
+        initial_columns = ["timestamp_import", "drive_file_id", "file_name", "drive_mime", "empresa", "cnpj", "descricao_itens", "data_compra", "valor_total", "numero_nota", "cpf", "endereco"]
+        ws_data.append_row(initial_columns) # Adiciona cabeçalhos se a aba foi criada agora
 
     # garantir a aba Processed_Files
     try:
         ws_proc = sh.worksheet(processed_tab)
     except Exception:
         ws_proc = sh.add_worksheet(title=processed_tab, rows="1000", cols="10")
+        initial_proc_columns = ["fileId","name","mimeType","processed_at","modifiedTime", "note"]
+        ws_proc.append_row(initial_proc_columns) # Adiciona cabeçalhos se a aba foi criada agora
+
 
     # ler processados (se não estiver em modo de reprocessamento total)
-    proc_df = pd.DataFrame(ws_proc.get_all_records()) if ws_proc.get_all_records() else pd.DataFrame(columns=["fileId","name","mimeType","processed_at","modifiedTime"])
-    processed_ids = set(proc_df["fileId"].astype(str).tolist()) if not proc_df.empty else set()
+    # Ignorar a primeira linha se for o cabeçalho
+    proc_records = ws_proc.get_all_records()
+    proc_df = pd.DataFrame(proc_records) if proc_records else pd.DataFrame(columns=["fileId","name","mimeType","processed_at","modifiedTime", "note"])
+    processed_ids = set(proc_df["fileId"].astype(str).tolist()) if not proc_df.empty and "fileId" in proc_df.columns else set()
+
 
     # identificar arquivos para processar
     if reprocess_all:
@@ -338,7 +457,8 @@ if st.sidebar.button(button_label):
     processed_rows = []
     
     # Carregar dados existentes para atualização (se houver)
-    existing_data_df = pd.DataFrame(ws_data.get_all_records()) if ws_data.get_all_records() else pd.DataFrame(columns=["timestamp_import", "drive_file_id", "file_name", "drive_mime", "empresa", "cnpj", "descricao_itens", "data_compra", "valor_total", "numero_nota", "cpf", "endereco"])
+    data_records = ws_data.get_all_records()
+    existing_data_df = pd.DataFrame(data_records) if data_records else pd.DataFrame(columns=["timestamp_import", "drive_file_id", "file_name", "drive_mime", "empresa", "cnpj", "descricao_itens", "data_compra", "valor_total", "numero_nota", "cpf", "endereco"])
 
 
     for f in files_to_process:
@@ -414,8 +534,8 @@ if st.sidebar.button(button_label):
             new_data_df = pd.DataFrame(results_rows)
             
             if existing_data_df.empty:
-                # Se a planilha está vazia, apenas escreva o novo dataframe
-                set_with_dataframe(ws_data, new_data_df, include_index=False, include_column_header=True)
+                # Se a planilha está vazia, apenas escreva o novo dataframe (já com cabeçalhos garantidos)
+                set_with_dataframe(ws_data, new_data_df, include_index=False, include_column_header=False) # cabeçalho já existe
             else:
                 # Combinar dados existentes com novos, priorizando os novos em caso de conflito no 'drive_file_id'
                 # Convertendo para string para garantir a comparação correta de IDs
@@ -427,7 +547,9 @@ if st.sidebar.button(button_label):
                 # Depois concatena com o new_data_df
                 combined_df = pd.concat([existing_data_df[~existing_data_df['drive_file_id'].isin(new_data_df['drive_file_id'])], new_data_df], ignore_index=True)
                 
-                set_with_dataframe(ws_data, combined_df, include_index=False, include_column_header=True)
+                # Ajustar a ordem das colunas para corresponder à planilha (se necessário)
+                combined_df = combined_df[initial_columns] # Garante que a ordem das colunas é a esperada
+                set_with_dataframe(ws_data, combined_df, include_index=False, include_column_header=False) # cabeçalho já existe
             st.success(f"{len(results_rows)} linha(s) gravadas/atualizadas em '{sheet_tab}'.")
         except Exception as e:
             st.error(f"Erro ao gravar dados: {e}")
@@ -435,15 +557,21 @@ if st.sidebar.button(button_label):
     # gravar Processed_Files
     if processed_rows:
         try:
-            existing_proc = pd.DataFrame(ws_proc.get_all_records()) if ws_proc.get_all_records() else pd.DataFrame()
+            # Re-ler para garantir que estamos atualizando a versão mais recente
+            proc_records_latest = ws_proc.get_all_records()
+            existing_proc_latest = pd.DataFrame(proc_records_latest) if proc_records_latest else pd.DataFrame(columns=["fileId","name","mimeType","processed_at","modifiedTime", "note"])
+            
             new_proc_df = pd.DataFrame(processed_rows)
-            if existing_proc.empty:
-                set_with_dataframe(ws_proc, new_proc_df, include_index=False, include_column_header=True)
+            
+            if existing_proc_latest.empty:
+                set_with_dataframe(ws_proc, new_proc_df, include_index=False, include_column_header=False) # cabeçalho já existe
             else:
-                # evitar duplicatas: concat e drop_duplicates por fileId mantendo última ocorrência
-                combined_proc = pd.concat([existing_proc, new_proc_df], ignore_index=True)
+                combined_proc = pd.concat([existing_proc_latest, new_proc_df], ignore_index=True)
                 combined_proc = combined_proc.sort_values("processed_at").drop_duplicates(subset=["fileId"], keep="last")
-                set_with_dataframe(ws_proc, combined_proc, include_index=False, include_column_header=True)
+                
+                # Ajustar a ordem das colunas
+                combined_proc = combined_proc[initial_proc_columns]
+                set_with_dataframe(ws_proc, combined_proc, include_index=False, include_column_header=False) # cabeçalho já existe
             st.success(f"{len(processed_rows)} arquivo(s) marcados como processados.")
         except Exception as e:
             st.error(f"Erro ao gravar Processed_Files: {e}")
