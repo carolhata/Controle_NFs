@@ -1,10 +1,9 @@
 """
-Streamlit app: varre uma pasta do Google Drive, detecta arquivos novos,
+Streamlit app: varre uma pasta do Google Drive, detecta arquivos novos ou reprocessa todos,
 extrai campos de notas fiscais e grava no Google Sheets.
-- Requer: colocar JSON da Service Account em st.secrets["GOOGLE_SERVICE_ACCOUNT"]
-- Fluxo: listar pasta -> comparar com Processed_Files sheet -> processar novos -> anotar Processed_Files
+Requer: colocar JSON da Service Account em st.secrets["GOOGLE_SERVICE_ACCOUNT"]
+Fluxo: listar pasta -> (opcionalmente ignorar Processed_Files sheet) -> processar -> anotar Processed_Files
 """
-
 import streamlit as st
 import pandas as pd
 import io
@@ -73,10 +72,11 @@ def list_files_in_folder(service, folder_id, page_size=1000):
     return files
 
 def download_drive_file(service, file_id, dest_path, mime=None):
-    # Se for Google Docs (document) precisamos usar export; aqui detectamos pelo mime se passado
     meta = service.files().get(fileId=file_id, fields="id,name,mimeType").execute()
     mime = meta.get("mimeType")
     name = meta.get("name")
+    
+    # Tratamento para Google Docs (exportar como texto simples)
     if mime == "application/vnd.google-apps.document":
         request = service.files().export_media(fileId=file_id, mimeType="text/plain")
         fh = io.BytesIO()
@@ -87,7 +87,7 @@ def download_drive_file(service, file_id, dest_path, mime=None):
         fh.seek(0)
         with open(dest_path, "wb") as f:
             f.write(fh.read())
-        return dest_path, mime
+        return dest_path, mime # Retorna o mime original para registro
     else:
         request = service.files().get_media(fileId=file_id)
         fh = io.BytesIO()
@@ -98,7 +98,7 @@ def download_drive_file(service, file_id, dest_path, mime=None):
         fh.seek(0)
         with open(dest_path, "wb") as f:
             f.write(fh.read())
-        return dest_path, mime
+        return dest_path, mime # Retorna o mime original para registro
 
 # ---------- Extração de texto ----------
 def extract_text_from_pdf(path):
@@ -120,12 +120,10 @@ def extract_text_via_ocr(path):
             with pdfplumber.open(path) as pdf:
                 for p in pdf.pages:
                     im = p.to_image(resolution=200).original
-                    # Usando lang='por+eng'
                     txt = pytesseract.image_to_string(im, lang='por+eng')
                     text += txt + "\n"
         else:
             im = Image.open(path)
-            # Usando lang='por+eng'
             txt = pytesseract.image_to_string(im, lang='por+eng')
             text += txt
     except Exception as e:
@@ -133,22 +131,19 @@ def extract_text_via_ocr(path):
     return text
 
 # ---------- Parsers ----------
-CNPJ_RE = re.compile(r"(?:CNPJ[:\s]*|C\.?NPJ[:\s]*|CNPJ\s*)?([0-9]{2}[\.\/-]?[0-9]{3}[\.\/-]?[0-9]{3}[\/\-]?[0-9]{4}[-]?[0-9]{2})")
-CPF_RE = re.compile(r"(?:CPF[:\s]*|CPF\s*)?([0-9]{3}[\.\/-]?[0-9]{3}[\.\/-]?[0-9]{3}[-]?[0-9]{2})")
-# Ajustado VAL_RE para ser mais explícito para formatos de dinheiro
-VAL_RE = re.compile(r"R\$?\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+,\d{2})") # Captura valores como 1.234,56 ou 123,45
-DATE_RE = re.compile(r"([0-3]?[0-9][\/\-][0-1]?[0-9][\/\-][0-9]{2,4}|[0-9]{4}-[0-9]{2}-[0-9]{2})")
-# Ajustado NF_RE para incluir 'SAT No.' e outras variações
-NF_RE = re.compile(r"(?:N(?:\.|º|o)?\s*F(?:iscal)?[:\s]*|Nota\s+Fiscal[:\s]*|N[:º\s]*|SAT\s*No\.?\s*|\s*NFC-e\s*|\s*NF-e\s*|Nr\s+Documento[:\s]*)([0-9\-/\.]+)")
-
+CNPJ_RE = re.compile(r"(?:CNPJ[:\s]|C.?NPJ[:\s]|CNPJ\s*)?([0-9]{2}[./-]?[0-9]{3}[./-]?[0-9]{3}[/-]?[0-9]{4}[-]?[0-9]{2})")
+CPF_RE = re.compile(r"(?:CPF[:\s]|CPF\s)?([0-9]{3}[./-]?[0-9]{3}[./-]?[0-9]{3}[-]?[0-9]{2})")
+VAL_RE = re.compile(r"R$?\s*(\d{1,3}(?:.\d{3})*(?:,\d{2})|\d+,\d{2})")
+DATE_RE = re.compile(r"([0-3]?[0-9][/-][0-1]?[0-9][/-][0-9]{2,4}|[0-9]{4}-[0-9]{2}-[0-9]{2})")
+NF_RE = re.compile(r"(?:N(?:.|º|o)?\sF(?:iscal)?[:\s]|Nota\s+Fiscal[:\s]|N[:º\s]|SAT\sNo.?\s|\sNFC-e\s|\sNF-e\s|Nr\s+Documento[:\s]*)([0-9-/.]+)")
 
 def normalize_money(s):
     if not s:
         return None
     s = s.strip()
-    s = re.sub(r"[Rr]\$\s*", "", s) # Remove "R$"
-    s = s.replace(".", "") # Remove separador de milhar
-    s = s.replace(",", ".") # Troca vírgula por ponto para decimais
+    s = re.sub(r"[Rr]$\s*", "", s)
+    s = s.replace(".", "")
+    s = s.replace(",", ".")
     try:
         return float(s)
     except ValueError:
@@ -188,24 +183,23 @@ def extract_fields_from_text(text):
             snippet = text[idx: idx + 150]
             mval = VAL_RE.search(snippet)
             if mval:
-                total = normalize_money(mval.group(1)) # group(1) pois a regex tem grupo de captura
+                total = normalize_money(mval.group(1))
                 if total is not None:
                     break
-    if total is None: # Se não encontrou por palavra-chave, tenta o maior valor numérico
+    if total is None:
         all_vals = VAL_RE.findall(text)
         if all_vals:
             nums_parsed = [normalize_money(v) for v in all_vals if normalize_money(v) is not None]
             if nums_parsed:
-                total = max(nums_parsed) # Pega o maior valor numérico encontrado
+                total = max(nums_parsed)
     out["valor_total"] = total
     if out["valor_total"]: st.write(f"Valor Total encontrado: {out['valor_total']}")
 
     # Extrair Empresa (Razão Social) - Lógica aprimorada
     company = None
-    lines = [l.strip() for l in text.splitlines() if l.strip()] # Todas as linhas não vazias
-    
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
     if lines:
-        # 1. Tentar a linha acima do CNPJ se o CNPJ for encontrado e a linha for razoável
         m_cnpj = CNPJ_RE.search(text)
         if m_cnpj:
             cnpj_pos = m_cnpj.start()
@@ -213,53 +207,45 @@ def extract_fields_from_text(text):
             text_before_cnpj = [l.strip() for l in text_before_cnpj if l.strip()]
 
             if text_before_cnpj:
-                # Tentar a última linha antes do CNPJ
                 candidate_company_line = text_before_cnpj[-1]
-                # Heurística: se a linha é predominantemente maiúscula, sem muitos números ou datas
                 if candidate_company_line.isupper() and len(candidate_company_line) > 5 and not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+', candidate_company_line):
                     company = candidate_company_line
-                elif len(text_before_cnpj) > 1: # Tentar a penúltima se a última não for boa
+                elif len(text_before_cnpj) > 1:
                     candidate_company_line = text_before_cnpj[-2]
                     if candidate_company_line.isupper() and len(candidate_company_line) > 5 and not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+', candidate_company_line):
                         company = candidate_company_line
 
-        # 2. Se ainda não encontrou, procurar por palavras-chave de empresa na primeira parte do documento
         if not company:
-            search_area = "\n".join(lines[:10]) # Limitar a busca às primeiras 10 linhas
-            company_keywords = ["LTDA", "MEI", "EIRELI", "S.A.", "SA", "S A", "COMERCIO", "SERVICOS", "MATERIAIS"] # Adicionado MATERIAIS
+            search_area = "\n".join(lines[:10])
+            company_keywords = ["LTDA", "MEI", "EIRELI", "S.A.", "SA", "S A", "COMERCIO", "SERVICOS", "MATERIAIS"]
             for keyword in company_keywords:
-                # Procurar a linha que contém a palavra-chave e não é muito curta
                 for l in search_area.splitlines():
-                    if keyword in l.upper() and len(l) > 10: # Aumentar o mínimo de caracteres
+                    if keyword in l.upper() and len(l) > 10:
                         company = l.strip()
                         break
                 if company:
                     break
 
-        # 3. Último recurso: a primeira linha significativa em maiúsculas (no topo)
         if not company and lines:
-            for l in lines[:5]: # Procurar nas primeiras 5 linhas
-                if l.isupper() and len(l) > 10 and not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+', l): # Checar se não parece endereço ou data
+            for l in lines[:5]:
+                if l.isupper() and len(l) > 10 and not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+', l):
                     company = l
                     break
-    
+
     out["empresa"] = company
     if out["empresa"]: st.write(f"Empresa encontrada: {out['empresa']}")
 
     # Extrair Endereço
     address = None
     address_keywords = ["Endereço", "Endereço:", "Rua ", "R. ", "Av ", "Avenida", "Logradouro", "BAIRRO", "CIDADE", "CEP"]
-    # Buscar em um snippet maior ou em várias linhas após uma palavra-chave
     for keyword in address_keywords:
         idx = text.find(keyword)
         if idx != -1:
-            snippet = text[idx: idx + 200] # Aumentar o snippet de busca
-            # Tentar pegar a linha completa ou as 2-3 linhas seguintes para o endereço
+            snippet = text[idx: idx + 200]
             address_lines = snippet.splitlines()
             if address_lines:
-                # Filtrar linhas que parecem ser endereços (contém palavras-chave de rua/número/bairro/cidade/cep)
                 potential_address_lines = []
-                for al in address_lines[:5]: # Olhar as próximas 5 linhas
+                for al in address_lines[:5]:
                     if any(sub_keyword in al for sub_keyword in ["Rua", "Av", "Bairro", "CEP", "Cidade", "Numero", "Nº", ","]) and len(al) > 10:
                         potential_address_lines.append(al.strip())
                 
@@ -272,7 +258,6 @@ def extract_fields_from_text(text):
 
     # Extrair Descrição de Itens - Lógica aprimorada
     items=[]
-    # Palavras-chave para ignorar linhas que não são itens de descrição
     ignore_keywords_items = ["SUBTOTAL", "TOTAL", "IMPOSTOS", "ICMS", "ISS", "DESCONTO", 
                              "FORMA DE PAGAMENTO", "TROCO", "CRÉDITO", "DÉBITO", "DINHEIRO", 
                              "VALOR", "CPF DO CONSUMIDOR", "CNPJ", "IE", "CUPOM FISCAL", 
@@ -280,11 +265,8 @@ def extract_fields_from_text(text):
 
     for line in text.splitlines():
         line_clean = line.strip()
-        # Verifica se contém padrão de dinheiro/número (ex: "10,00" ou "10.00")
         if re.search(r"\d+,\d{2}|\d+\.\d{2}", line_clean):
-            # Verifica o comprimento mínimo e que tem alguma letra (não só números e símbolos)
             if len(line_clean) > 5 and re.search(r"[a-zA-Z]", line_clean):
-                # Verifica se a linha NÃO contém palavras-chave de ignorar (case-insensitive)
                 if not any(keyword in line_clean.upper() for keyword in ignore_keywords_items):
                     items.append(line_clean)
     out["itens_descricoes"] = "\n".join(items[:40]) if items else None
@@ -294,19 +276,21 @@ def extract_fields_from_text(text):
 
 # ---------- UI inputs ----------
 st.sidebar.header("Parâmetros")
-
-# Carregar do secrets
-creds_check = get_google_creds() # Apenas para garantir que secrets está configurado
+creds_check = get_google_creds()
 
 drive_folder_id = st.sidebar.text_input("ID da pasta no Google Drive (folderId)", value=st.secrets.get("DRIVE_FOLDER_ID", ""))
 spreadsheet_id = st.sidebar.text_input("ID do Google Sheets (spreadsheetId)", value=st.secrets.get("GOOGLE_SHEET_ID", ""))
 sheet_tab = st.sidebar.text_input("Nome da aba para dados", value=st.secrets.get("DATA_SHEET_NAME", "NF_Import"))
 processed_tab = st.sidebar.text_input("Aba para arquivos processados", value=st.secrets.get("PROCESSED_FILES_SHEET_NAME", "Processed_Files"))
 
+# Nova opção para reprocessar todos os arquivos
+reprocess_all = st.sidebar.checkbox("Reprocessar todos os arquivos?", value=False)
+
+button_label = "Processar Todos os Arquivos" if reprocess_all else "Verificar nova(s) NF(s)"
 st.sidebar.markdown("Depois de preencher, clique em 'Verificar nova(s) NF(s)'")
 
 # ---------- Main processing ----------
-if st.sidebar.button("Verificar nova(s) NF(s)"):
+if st.sidebar.button(button_label):
     if not drive_folder_id or not spreadsheet_id:
         st.error("Forneça folderId do Drive e spreadsheetId do Sheets nas configurações de Secrets ou nos campos acima.")
         st.stop()
@@ -338,29 +322,40 @@ if st.sidebar.button("Verificar nova(s) NF(s)"):
     except Exception:
         ws_proc = sh.add_worksheet(title=processed_tab, rows="1000", cols="10")
 
-    # ler processados
+    # ler processados (se não estiver em modo de reprocessamento total)
     proc_df = pd.DataFrame(ws_proc.get_all_records()) if ws_proc.get_all_records() else pd.DataFrame(columns=["fileId","name","mimeType","processed_at","modifiedTime"])
     processed_ids = set(proc_df["fileId"].astype(str).tolist()) if not proc_df.empty else set()
 
-    # identificar novos
-    new_files = [f for f in files if str(f.get("id")) not in processed_ids]
-    st.write(f"Novos arquivos a processar: {len(new_files)}")
+    # identificar arquivos para processar
+    if reprocess_all:
+        files_to_process = files
+        st.write(f"Reprocessando TODOS os arquivos: {len(files_to_process)}")
+    else:
+        files_to_process = [f for f in files if str(f.get("id")) not in processed_ids]
+        st.write(f"Novos arquivos a processar: {len(files_to_process)}")
 
     results_rows = []
     processed_rows = []
+    
+    # Carregar dados existentes para atualização (se houver)
+    existing_data_df = pd.DataFrame(ws_data.get_all_records()) if ws_data.get_all_records() else pd.DataFrame(columns=["timestamp_import", "drive_file_id", "file_name", "drive_mime", "empresa", "cnpj", "descricao_itens", "data_compra", "valor_total", "numero_nota", "cpf", "endereco"])
 
-    for f in new_files:
+
+    for f in files_to_process:
         fid = f.get("id")
         name = f.get("name")
         mime = f.get("mimeType")
         modified = f.get("modifiedTime", "")
         st.write(f"Processando: {name} ({fid}) — {mime}")
+        
         tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
         try:
             path, actual_mime = download_drive_file(drive, fid, tmpf.name)
             tmpf.close()
+            
             kind = magic.from_file(path, mime=True)
             st.write(f"Download OK. MIME detectado: {kind}")
+            
             extracted = ""
             if path.lower().endswith(".txt") or actual_mime=="text/plain":
                 with open(path, "r", encoding="utf-8", errors="ignore") as fh:
@@ -376,7 +371,6 @@ if st.sidebar.button("Verificar nova(s) NF(s)"):
 
             if not extracted or len(extracted.strip())==0:
                 st.warning(f"Nenhum texto extraído do arquivo {name}. Pulei.")
-                # registrar mesmo assim como processado para evitar loop (opcional)
                 processed_rows.append({
                     "fileId": fid, "name": name, "mimeType": mime, "processed_at": datetime.now().isoformat(), "modifiedTime": modified, "note": "no_text_extracted"
                 })
@@ -414,17 +408,25 @@ if st.sidebar.button("Verificar nova(s) NF(s)"):
             except:
                 pass
 
-    # gravar resultados na aba NF_Import
+    # gravar resultados na aba NF_Import (com lógica de upsert)
     if results_rows:
         try:
-            existing_data = pd.DataFrame(ws_data.get_all_records()) if ws_data.get_all_records() else pd.DataFrame()
             new_data_df = pd.DataFrame(results_rows)
-            if existing_data.empty:
+            
+            if existing_data_df.empty:
+                # Se a planilha está vazia, apenas escreva o novo dataframe
                 set_with_dataframe(ws_data, new_data_df, include_index=False, include_column_header=True)
             else:
-                combined = pd.concat([existing_data, new_data_df], ignore_index=True)
-                set_with_dataframe(ws_data, combined, include_index=False, include_column_header=True)
-            st.success(f"{len(results_rows)} linha(s) gravadas em '{sheet_tab}'.")
+                # Combinar dados existentes com novos, priorizando os novos em caso de conflito no 'drive_file_id'
+                # Convertendo para string para garantir a comparação correta de IDs
+                existing_data_df["drive_file_id"] = existing_data_df["drive_file_id"].astype(str)
+                new_data_df["drive_file_id"] = new_data_df["drive_file_id"].astype(str)
+
+                # Remover linhas existentes que serão atualizadas pelos novos dados
+                combined_df = pd.concat([existing_data_df[~existing_data_df['drive_file_id'].isin(new_data_df['drive_file_id'])], new_data_df], ignore_index=True)
+                
+                set_with_dataframe(ws_data, combined_df, include_index=False, include_column_header=True)
+            st.success(f"{len(results_rows)} linha(s) gravadas/atualizadas em '{sheet_tab}'.")
         except Exception as e:
             st.error(f"Erro ao gravar dados: {e}")
 
@@ -446,29 +448,29 @@ if st.sidebar.button("Verificar nova(s) NF(s)"):
 
     # mostrar resumo
     st.subheader("Resumo de execução")
-    st.write(f"Arquivos encontrados: {len(files)}")
-    st.write(f"Novos processados: {len(results_rows)} (gravados em '{sheet_tab}')")
-    st.write(f"Arquivos marcados processados: {len(processed_rows)} (gravados em '{processed_tab}')")
+    st.write(f"Arquivos encontrados na pasta: {len(files)}")
+    st.write(f"Arquivos processados (novos ou reprocessados): {len(results_rows)} (gravados/atualizados em '{sheet_tab}')")
+    st.write(f"Arquivos marcados como processados: {len(processed_rows)} (gravados em '{processed_tab}')")
 
     # exibir primeiras linhas gravadas
     if results_rows:
-        st.subheader("Amostra dos dados gravados")
+        st.subheader("Amostra dos dados gravados/atualizados")
         st.dataframe(pd.DataFrame(results_rows).head(20))
 
     if processed_rows:
         st.subheader("Amostra dos arquivos marcados como processados")
         st.dataframe(pd.DataFrame(processed_rows).head(20))
-
+        
 st.markdown("---")
-st.markdown("**Notas / recomendações**")
+st.markdown("Notas / recomendações")
 st.markdown(
-    """
-    - A Service Account precisa ser *Viewer* na pasta (ou nos arquivos) e *Editor* na planilha.
-    - O app registra os `fileId` processados na aba `Processed_Files` para não reprocessar.
-    - Para arquivos escaneados, OCR depende do binário Tesseract disponível no ambiente.
-    - Podemos adaptar para:
-        * Processar somente arquivos com extensão específica (.pdf, .docx, .xml)
-        * Rodar em lote (bulk) e enviar relatório por e-mail
-        * Usar Google Vision API se precisar de OCR de alta qualidade
-    """
+"""
+- A Service Account precisa ser Viewer na pasta (ou nos arquivos) e Editor na planilha.
+- O app registra os fileId processados na aba Processed_Files para não reprocessar.
+- Para arquivos escaneados, OCR depende do binário Tesseract disponível no ambiente.
+- Podemos adaptar para:
+    * Processar somente arquivos com extensão específica (.pdf, .docx, .xml)
+    * Rodar em lote (bulk) e enviar relatório por e-mail
+    * Usar Google Vision API se precisar de OCR de alta qualidade
+"""
 )
