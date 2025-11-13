@@ -133,7 +133,7 @@ def extract_text_via_ocr(path):
 # ---------- Parsers ----------
 CNPJ_RE = re.compile(r"(?:CNPJ[:\s]|C.?NPJ[:\s]|CNPJ\s*)?([0-9]{2}[./-]?[0-9]{3}[./-]?[0-9]{3}[/-]?[0-9]{4}[-]?[0-9]{2})")
 CPF_RE = re.compile(r"(?:CPF[:\s]|CPF\s)?([0-9]{3}[./-]?[0-9]{3}[./-]?[0-9]{3}[-]?[0-9]{2})")
-VAL_RE = re.compile(r"R$?\s*(\d{1,3}(?:.\d{3})*(?:,\d{2})|\d+,\d{2})")
+VAL_RE = re.compile(r"R\$?\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+,\d{2})") # CORRIGIDO: Escapado o ponto
 DATE_RE = re.compile(r"([0-3]?[0-9][/-][0-1]?[0-9][/-][0-9]{2,4}|[0-9]{4}-[0-9]{2}-[0-9]{2})")
 NF_RE = re.compile(r"(?:N(?:.|º|o)?\sF(?:iscal)?[:\s]|Nota\s+Fiscal[:\s]|N[:º\s]|SAT\sNo.?\s|\sNFC-e\s|\sNF-e\s|Nr\s+Documento[:\s]*)([0-9-/.]+)")
 
@@ -287,7 +287,7 @@ processed_tab = st.sidebar.text_input("Aba para arquivos processados", value=st.
 reprocess_all = st.sidebar.checkbox("Reprocessar todos os arquivos?", value=False)
 
 button_label = "Processar Todos os Arquivos" if reprocess_all else "Verificar nova(s) NF(s)"
-st.sidebar.markdown("Depois de preencher, clique em 'Verificar nova(s) NF(s)'")
+st.sidebar.markdown("Depois de preencher, clique no botão para iniciar.")
 
 # ---------- Main processing ----------
 if st.sidebar.button(button_label):
@@ -422,7 +422,9 @@ if st.sidebar.button(button_label):
                 existing_data_df["drive_file_id"] = existing_data_df["drive_file_id"].astype(str)
                 new_data_df["drive_file_id"] = new_data_df["drive_file_id"].astype(str)
 
-                # Remover linhas existentes que serão atualizadas pelos novos dados
+                # Remover linhas existentes que seriam duplicadas pelos novos dados
+                # Filtra o existing_data_df para manter apenas as linhas cujos 'drive_file_id' NÃO estão no new_data_df
+                # Depois concatena com o new_data_df
                 combined_df = pd.concat([existing_data_df[~existing_data_df['drive_file_id'].isin(new_data_df['drive_file_id'])], new_data_df], ignore_index=True)
                 
                 set_with_dataframe(ws_data, combined_df, include_index=False, include_column_header=True)
