@@ -1,4 +1,3 @@
-
 """
 Streamlit app: varre uma pasta do Google Drive, detecta arquivos novos ou reprocessa todos,
 extrai campos de notas fiscais e grava no Google Sheets.
