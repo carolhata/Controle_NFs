@@ -1,3 +1,4 @@
+
 """
 Streamlit app: varre uma pasta do Google Drive, detecta arquivos novos ou reprocessa todos,
 extrai campos de notas fiscais e grava no Google Sheets.
@@ -171,7 +172,7 @@ def extract_fields_from_text(text):
     # Extrair Data de Compra - Aprimorando a busca
     out["data_compra"] = None
     # Priorizar buscas com palavras-chave
-    date_keywords = ["DATA DE EMISSÃO", "EMISSÃO", "DATA/HORA", "DATA"]
+    date_keywords = ["DATA DE EMISSÃO", "EMISSÃO", "DATA/HORA", "DATA", "DATE"]
     for kw in date_keywords:
         idx = text.upper().find(kw)
         if idx != -1:
@@ -189,7 +190,7 @@ def extract_fields_from_text(text):
 
     # Extrair Número da Nota - Aprimorando a busca
     out["numero_nota"] = None
-    nf_keywords = ["NÚMERO:", "NÚMERO DA NOTA", "NOTA FISCAL Nº", "SAT NO.", "Nr Documento"]
+    nf_keywords = ["NÚMERO:", "NÚMERO DA NOTA", "NOTA FISCAL Nº", "SAT NO.", "Nr Documento", "NF-E", "NFC-E"]
     for kw in nf_keywords:
         idx = text.upper().find(kw)
         if idx != -1:
@@ -205,7 +206,7 @@ def extract_fields_from_text(text):
 
     # Extrair Valor Total - Lógica existing está boa, mas garatindo que 'VAL_RE' está correto
     total = None
-    for keyword in ["valor total", "total da nota", "total", "valor da nota", "total geral", "valor a pagar"]:
+    for keyword in ["valor total", "total da nota", "total", "valor da nota", "total geral", "valor a pagar", "valor a receber"]:
         idx = text.lower().find(keyword)
         if idx != -1:
             snippet = text[idx: idx + 150]
@@ -242,7 +243,7 @@ def extract_fields_from_text(text):
                     # Heurística: linha com mais de 5 caracteres, predominantemente maiúscula, sem muitas datas/valores/endereços
                     if len(candidate_company_line) > 5 and \
                        (candidate_company_line.isupper() or sum(1 for c in candidate_company_line if c.isupper()) / len(candidate_company_line) > 0.7) and \
-                       not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+|RUA|AVENIDA|BAIRRO|CEP', candidate_company_line.upper()):
+                       not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+|RUA|AVENIDA|BAIRRO|CEP|CPF', candidate_company_line.upper()):
                         company = candidate_company_line
                         break
                 if company:
@@ -251,11 +252,11 @@ def extract_fields_from_text(text):
         # Se não encontrou antes do CNPJ, procura por palavras-chave no início do documento
         if not company:
             search_area = "\n".join(lines[:10])
-            company_keywords = ["LTDA", "MEI", "EIRELI", "S.A.", "SA", "COMERCIO", "SERVICOS", "MATERIAIS", "INDUSTRIA"]
+            company_keywords = ["LTDA", "MEI", "EIRELI", "S.A.", "SA", "COMERCIO", "SERVICOS", "MATERIAIS", "INDUSTRIA", "PREFEITURA"]
             for keyword in company_keywords:
                 for l in search_area.splitlines():
                     if keyword in l.upper() and len(l) > 10 and \
-                       not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+|RUA|AVENIDA|BAIRRO|CEP', l.upper()): # Evitar endereços
+                       not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+|RUA|AVENIDA|BAIRRO|CEP|CPF', l.upper()): # Evitar endereços e CPF
                         company = l.strip()
                         break
                 if company:
@@ -264,7 +265,7 @@ def extract_fields_from_text(text):
         # Último recurso: a primeira linha significativa em maiúsculas (no topo)
         if not company and lines:
             for l in lines[:5]:
-                if l.isupper() and len(l) > 10 and not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+|RUA|AVENIDA|BAIRRO|CEP', l.upper()):
+                if l.isupper() and len(l) > 10 and not re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{3}-\d{3}|\d+\,\d+|\d+\.\d+|RUA|AVENIDA|BAIRRO|CEP|CPF', l.upper()):
                     company = l
                     break
 
@@ -288,9 +289,9 @@ def extract_fields_from_text(text):
             for al in snippet_lines[:7]: # Limita a busca às próximas 7 linhas
                 if (any(sub_keyword in al.upper() for sub_keyword in ["RUA", "AV", "BAIRRO", "CEP", "CIDADE", "NUMERO", "Nº", ",", "EDF", "APTO"]) and 
                     len(al) > 5 and # Linha minimamente longa
-                    not re.search(r'CNPJ|CPF|INSCRIÇÃO|IE|TELEFONE|CELULAR|E-MAIL|HTTP', al.upper())): # Evita outras informações
+                    not re.search(r'CNPJ|CPF|INSCRIÇÃO|IE|TELEFONE|CELULAR|E-MAIL|HTTP|VALOR|TOTAL|IMPOSTO', al.upper())): # Evita outras informações
                     potential_address_parts.append(al)
-                elif len(potential_address_parts) > 0 and len(al) > 5 and not re.search(r'CNPJ|CPF|INSCRIÇÃO|IE|TELEFONE|CELULAR|E-MAIL|HTTP', al.upper()):
+                elif len(potential_address_parts) > 0 and len(al) > 5 and not re.search(r'CNPJ|CPF|INSCRIÇÃO|IE|TELEFONE|CELULAR|E-MAIL|HTTP|VALOR|TOTAL|IMPOSTO', al.upper()):
                     # Se já encontrou partes de endereço, inclui linhas subsequentes que pareçam continuar o endereço
                     potential_address_parts.append(al)
                 else:
@@ -312,11 +313,13 @@ def extract_fields_from_text(text):
                              "VALOR", "CPF DO CONSUMIDOR", "CNPJ", "IE", "CUPOM FISCAL", 
                              "SAT NO", "NOTA FISCAL", "LANÇAMENTO", "DATA", "CÓDIGO", 
                              "UNIDADE", "QTD", "PRODUTO", "DESCRIÇÃO", "VALOR UNITÁRIO", 
-                             "VALOR TOTAL"]
+                             "VALOR TOTAL", "CLIENTE", "CONSUMIDOR", "ENDEREÇO", "BAIRRO", 
+                             "CIDADE", "CEP", "CONTATO", "TELEFONE", "CNPJ/CPF", "CPF/CNPJ",
+                             "DISCRIMINAÇÃO DOS SERVIÇOS", "TOTAL DA NOTA"]
     
     # Marcadores de início e fim da seção de itens (para melhor delimitação)
-    start_keywords = ["ITENS", "DESCRIÇÃO", "PRODUTOS E SERVIÇOS", "DETALHES DA VENDA", "CUPOM FISCAL", "NOTA FISCAL"]
-    end_keywords = ["VALOR TOTAL", "SUBTOTAL", "TOTAL A PAGAR", "FORMAS DE PAGAMENTO", "OBSERVAÇÕES"]
+    start_keywords = ["ITENS", "DESCRIÇÃO", "PRODUTOS E SERVIÇOS", "DETALHES DA VENDA", "CUPOM FISCAL", "NOTA FISCAL", "DISCRIMINAÇÃO", "VALOR TOTAL DO SERVIÇO", "SERVIÇOS PRESTADOS"]
+    end_keywords = ["VALOR TOTAL", "SUBTOTAL", "TOTAL A PAGAR", "FORMAS DE PAGAMENTO", "OBSERVAÇÕES", "INFORMÇÕES ADICIONAIS", "PAGAMENTO", "TOTAL GERAL"]
 
     in_items_section = False
     
@@ -325,7 +328,7 @@ def extract_fields_from_text(text):
         line_upper = line_clean.upper()
 
         if not in_items_section:
-            if any(kw in line_upper for kw in start_keywords) and len(line_clean) < 50: # Evitar capturar linhas muito longas como "start"
+            if any(kw in line_upper for kw in start_keywords) and len(line_clean) < 80: # Evitar capturar linhas muito longas como "start"
                 in_items_section = True
                 continue
         
@@ -336,8 +339,9 @@ def extract_fields_from_text(text):
             # Verifica se contém padrão de dinheiro/número (ex: "10,00" ou "10.00")
             # e também procura por um número de quantidade no início (ex: "1 X", "2 UN")
             # Ou se parece uma descrição de produto (letras e números)
-            if (re.search(r"\d+,\d{2}|\d+\.\d{2}", line_clean) and re.search(r"[a-zA-Z]", line_clean) and len(line_clean) > 5) or \
-               (re.search(r"^\d+\s*(?:X|UN|QTDE)\s*", line_upper) and len(line_clean) > 5):
+            if ((re.search(r"\d+,\d{2}|\d+\.\d{2}", line_clean) and re.search(r"[a-zA-Z]", line_clean) and len(line_clean) > 5) or # linha com valor e texto
+               (re.search(r"^\d+\s*(?:X|UN|QTDE|PÇ|KG)\s*(?:[a-zA-Z0-9\s]+?)\s+\d+,\d{2}|\d+\.\d{2}", line_clean)) or # linha com qtd e valor
+               (re.search(r"[a-zA-Z]{5,}", line_clean) and re.search(r"\d+", line_clean) and len(line_clean) > 10)) : # linha com texto longo e número
                 
                 # Verifica se a linha NÃO contém palavras-chave de ignorar (case-insensitive)
                 if not any(keyword in line_upper for keyword in ignore_keywords_items):
@@ -365,43 +369,57 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("Opções de processamento:")
 
 # Botão para limpar a planilha
+# Usamos st.session_state para gerenciar o estado da confirmação
+if 'confirm_clear_clicked' not in st.session_state:
+    st.session_state.confirm_clear_clicked = False
+
 if st.sidebar.button("🚨 Limpar Dados da Planilha"):
-    if not spreadsheet_id:
-        st.error("Forneça o spreadsheetId do Sheets antes de tentar limpar.")
-    else:
-        confirm_clear = st.sidebar.checkbox("Confirmar limpeza? (Irreversível!)")
-        if confirm_clear:
+    st.session_state.confirm_clear_clicked = True
+
+if st.session_state.confirm_clear_clicked:
+    st.sidebar.warning("ATENÇÃO: Esta ação apagará TODOS os dados das abas de 'Dados' e 'Processados'!")
+    confirm_clear_final = st.sidebar.checkbox("Confirmar limpeza agora? (Irreversível!)")
+    if confirm_clear_final:
+        if not spreadsheet_id:
+            st.error("Forneça o spreadsheetId do Sheets antes de tentar limpar.")
+        else:
             try:
                 gs_client = build_sheets_client(creds_check)
                 sh = gs_client.open_by_key(spreadsheet_id)
                 
-                # Limpa a aba de dados
+                # Colunas esperadas para cada aba
+                initial_columns_data = ["timestamp_import", "drive_file_id", "file_name", "drive_mime", "empresa", "cnpj", "descricao_itens", "data_compra", "valor_total", "numero_nota", "cpf", "endereco"]
+                initial_columns_proc = ["fileId","name","mimeType","processed_at","modifiedTime", "note"]
+
+                # Limpa e recria cabeçalhos na aba de dados
                 ws_data = sh.worksheet(sheet_tab)
                 ws_data.clear()
-                # Recria o cabeçalho
-                initial_columns = ["timestamp_import", "drive_file_id", "file_name", "drive_mime", "empresa", "cnpj", "descricao_itens", "data_compra", "valor_total", "numero_nota", "cpf", "endereco"]
-                ws_data.append_row(initial_columns)
+                ws_data.append_row(initial_columns_data)
                 st.success(f"Aba '{sheet_tab}' limpa e cabeçalho restaurado.")
                 
-                # Limpa a aba de arquivos processados
+                # Limpa e recria cabeçalhos na aba de arquivos processados
                 ws_proc = sh.worksheet(processed_tab)
                 ws_proc.clear()
-                # Recria o cabeçalho
-                initial_proc_columns = ["fileId","name","mimeType","processed_at","modifiedTime", "note"]
-                ws_proc.append_row(initial_proc_columns)
+                ws_proc.append_row(initial_columns_proc)
                 st.success(f"Aba '{processed_tab}' limpa e cabeçalho restaurado.")
-                st.warning("É necessário recarregar a página ou desmarcar 'Confirmar limpeza?' para continuar.")
-                st.stop() # Interrompe a execução para evitar reprocessamento imediato
+                
+                st.success("Planilhas limpas com sucesso! Por favor, prossiga com o reprocessamento.")
+                st.session_state.confirm_clear_clicked = False # Reseta o estado de confirmação
+                st.experimental_rerun() # Força uma nova execução para atualizar o UI
             except Exception as e:
                 st.error(f"Erro ao limpar planilha: {e}")
-        else:
-            st.info("Marque a caixa de confirmação para limpar a planilha.")
-            
+                st.session_state.confirm_clear_clicked = False # Reseta o estado em caso de erro
+    else:
+        if st.sidebar.button("Cancelar Limpeza"):
+            st.session_state.confirm_clear_clicked = False
+            st.experimental_rerun()
+
+
 st.sidebar.markdown("---")
-st.sidebar.markdown("Clique no botão abaixo para iniciar:")
+st.sidebar.markdown("Clique no botão abaixo para iniciar o processamento:")
 
 # ---------- Main processing ----------
-if st.sidebar.button(button_label):
+if st.sidebar.button(button_label, key="main_process_button"):
     if not drive_folder_id or not spreadsheet_id:
         st.error("Forneça folderId do Drive e spreadsheetId do Sheets nas configurações de Secrets ou nos campos acima.")
         st.stop()
@@ -414,34 +432,40 @@ if st.sidebar.button(button_label):
         files = list_files_in_folder(drive, drive_folder_id)
     st.success(f"{len(files)} arquivo(s) encontrados na pasta.")
 
-    # abrir planilha e carregar abas necessárias
-    try:
-        sh = gs_client.open_by_key(spreadsheet_id)
-    except Exception as e:
-        st.error(f"Erro ao abrir planilha: {e}")
-        st.stop()
+    # Colunas esperadas para cada aba
+    initial_columns_data = ["timestamp_import", "drive_file_id", "file_name", "drive_mime", "empresa", "cnpj", "descricao_itens", "data_compra", "valor_total", "numero_nota", "cpf", "endereco"]
+    initial_columns_proc = ["fileId","name","mimeType","processed_at","modifiedTime", "note"]
 
     # garantir a aba NF_Import
     try:
+        sh = gs_client.open_by_key(spreadsheet_id)
         ws_data = sh.worksheet(sheet_tab)
-    except Exception:
+        # Verifica se a primeira linha é o cabeçalho. Se não, limpa e recria.
+        if ws_data.row_values(1) != initial_columns_data:
+            st.warning(f"Cabeçalhos da aba '{sheet_tab}' inconsistentes. Limpando e recriando.")
+            ws_data.clear()
+            ws_data.append_row(initial_columns_data)
+    except Exception: # Se a aba não existe, cria e adiciona cabeçalhos
         ws_data = sh.add_worksheet(title=sheet_tab, rows="1000", cols="30")
-        initial_columns = ["timestamp_import", "drive_file_id", "file_name", "drive_mime", "empresa", "cnpj", "descricao_itens", "data_compra", "valor_total", "numero_nota", "cpf", "endereco"]
-        ws_data.append_row(initial_columns) # Adiciona cabeçalhos se a aba foi criada agora
+        ws_data.append_row(initial_columns_data)
 
     # garantir a aba Processed_Files
     try:
         ws_proc = sh.worksheet(processed_tab)
-    except Exception:
+        # Verifica se a primeira linha é o cabeçalho. Se não, limpa e recria.
+        if ws_proc.row_values(1) != initial_columns_proc:
+            st.warning(f"Cabeçalhos da aba '{processed_tab}' inconsistentes. Limpando e recriando.")
+            ws_proc.clear()
+            ws_proc.append_row(initial_columns_proc)
+    except Exception: # Se a aba não existe, cria e adiciona cabeçalhos
         ws_proc = sh.add_worksheet(title=processed_tab, rows="1000", cols="10")
-        initial_proc_columns = ["fileId","name","mimeType","processed_at","modifiedTime", "note"]
-        ws_proc.append_row(initial_proc_columns) # Adiciona cabeçalhos se a aba foi criada agora
+        ws_proc.append_row(initial_columns_proc)
 
 
     # ler processados (se não estiver em modo de reprocessamento total)
-    # Ignorar a primeira linha se for o cabeçalho
+    # Ignorar a primeira linha que é o cabeçalho
     proc_records = ws_proc.get_all_records()
-    proc_df = pd.DataFrame(proc_records) if proc_records else pd.DataFrame(columns=["fileId","name","mimeType","processed_at","modifiedTime", "note"])
+    proc_df = pd.DataFrame(proc_records) if proc_records else pd.DataFrame(columns=initial_columns_proc)
     processed_ids = set(proc_df["fileId"].astype(str).tolist()) if not proc_df.empty and "fileId" in proc_df.columns else set()
 
 
@@ -457,8 +481,9 @@ if st.sidebar.button(button_label):
     processed_rows = []
     
     # Carregar dados existentes para atualização (se houver)
+    # Ignorar a primeira linha que é o cabeçalho
     data_records = ws_data.get_all_records()
-    existing_data_df = pd.DataFrame(data_records) if data_records else pd.DataFrame(columns=["timestamp_import", "drive_file_id", "file_name", "drive_mime", "empresa", "cnpj", "descricao_itens", "data_compra", "valor_total", "numero_nota", "cpf", "endereco"])
+    existing_data_df = pd.DataFrame(data_records) if data_records else pd.DataFrame(columns=initial_columns_data)
 
 
     for f in files_to_process:
@@ -534,22 +559,17 @@ if st.sidebar.button(button_label):
             new_data_df = pd.DataFrame(results_rows)
             
             if existing_data_df.empty:
-                # Se a planilha está vazia, apenas escreva o novo dataframe (já com cabeçalhos garantidos)
-                set_with_dataframe(ws_data, new_data_df, include_index=False, include_column_header=False) # cabeçalho já existe
+                # Se a planilha estava vazia antes do processamento, já garantimos o cabeçalho.
+                set_with_dataframe(ws_data, new_data_df, include_index=False, include_column_header=False)
             else:
                 # Combinar dados existentes com novos, priorizando os novos em caso de conflito no 'drive_file_id'
-                # Convertendo para string para garantir a comparação correta de IDs
                 existing_data_df["drive_file_id"] = existing_data_df["drive_file_id"].astype(str)
                 new_data_df["drive_file_id"] = new_data_df["drive_file_id"].astype(str)
 
-                # Remover linhas existentes que seriam duplicadas pelos novos dados
-                # Filtra o existing_data_df para manter apenas as linhas cujos 'drive_file_id' NÃO estão no new_data_df
-                # Depois concatena com o new_data_df
                 combined_df = pd.concat([existing_data_df[~existing_data_df['drive_file_id'].isin(new_data_df['drive_file_id'])], new_data_df], ignore_index=True)
                 
-                # Ajustar a ordem das colunas para corresponder à planilha (se necessário)
-                combined_df = combined_df[initial_columns] # Garante que a ordem das colunas é a esperada
-                set_with_dataframe(ws_data, combined_df, include_index=False, include_column_header=False) # cabeçalho já existe
+                combined_df = combined_df[initial_columns_data] 
+                set_with_dataframe(ws_data, combined_df, include_index=False, include_column_header=False) 
             st.success(f"{len(results_rows)} linha(s) gravadas/atualizadas em '{sheet_tab}'.")
         except Exception as e:
             st.error(f"Erro ao gravar dados: {e}")
@@ -557,21 +577,19 @@ if st.sidebar.button(button_label):
     # gravar Processed_Files
     if processed_rows:
         try:
-            # Re-ler para garantir que estamos atualizando a versão mais recente
             proc_records_latest = ws_proc.get_all_records()
-            existing_proc_latest = pd.DataFrame(proc_records_latest) if proc_records_latest else pd.DataFrame(columns=["fileId","name","mimeType","processed_at","modifiedTime", "note"])
+            existing_proc_latest = pd.DataFrame(proc_records_latest) if proc_records_latest else pd.DataFrame(columns=initial_columns_proc)
             
             new_proc_df = pd.DataFrame(processed_rows)
             
             if existing_proc_latest.empty:
-                set_with_dataframe(ws_proc, new_proc_df, include_index=False, include_column_header=False) # cabeçalho já existe
+                set_with_dataframe(ws_proc, new_proc_df, include_index=False, include_column_header=False) 
             else:
                 combined_proc = pd.concat([existing_proc_latest, new_proc_df], ignore_index=True)
                 combined_proc = combined_proc.sort_values("processed_at").drop_duplicates(subset=["fileId"], keep="last")
                 
-                # Ajustar a ordem das colunas
-                combined_proc = combined_proc[initial_proc_columns]
-                set_with_dataframe(ws_proc, combined_proc, include_index=False, include_column_header=False) # cabeçalho já existe
+                combined_proc = combined_proc[initial_columns_proc]
+                set_with_dataframe(ws_proc, combined_proc, include_index=False, include_column_header=False) 
             st.success(f"{len(processed_rows)} arquivo(s) marcados como processados.")
         except Exception as e:
             st.error(f"Erro ao gravar Processed_Files: {e}")
