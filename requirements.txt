@@ -5,9 +5,9 @@ pillow==10.3.0
 google-auth
 google-api-python-client
 pdfplumber
-watchdog # Não é diretamente usado no script atual, mas mantido se for para futuro "folder watcher"
-python-magic # Necessário para magic.from_file
+watchdog
+python-magic
 pytesseract
 gspread_dataframe
-numpy # Adicionado explicitamente, pois cv2 o utiliza e é bom ter como dependência
-opencv-python # Adicionado, pois você usa cv2
+numpy
+opencv-python
