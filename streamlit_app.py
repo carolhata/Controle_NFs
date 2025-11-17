@@ -347,7 +347,7 @@ def extract_fields_from_text(text):
                 # Critérios para incluir a linha como parte do endereço
                 # Deve conter indicadores de endereço, e não ser outra coisa (CNPJ, telefone, etc.)
                 if (any(sub_keyword in al.upper() for sub_keyword in ["RUA", "AV", "BAIRRO", "CEP", "CIDADE", "ESTADO", "Nº", "NUMERO", ",", "EDF", "APTO"]) or 
-                    re.search(r'\d{5}-\d{3}|\d+\,\d+', al)) and # Contém CEP ou número com vírgula
+                    re.search(r'\d{5}-\d{3}|\d+\,\d+', al) and # Contém CEP ou número com vírgula
                    len(al) > 5 and \
                    not re.search(r'CNPJ|CPF|INSCRIÇÃO|IE|TELEFONE|CELULAR|E-MAIL|HTTP|VALOR|TOTAL|IMPOSTO|IEST|IMPOSTO', al.upper()):
                     
