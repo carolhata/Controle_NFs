@@ -327,7 +327,6 @@ def extract_fields_from_text(text, status_container=st):
 
             potential_address_parts = []
             for al in snippet_lines[:8]:
-                # CORREÇÃO: Removido o parêntese extra que causava o SyntaxError
                 if (any(sub_keyword in al.upper() for sub_keyword in ["RUA", "AV", "BAIRRO", "CEP", "CIDADE", "ESTADO", "Nº", "NUMERO", ",", "EDF", "APTO"]) or 
                     re.search(r'\d{5}-\d{3}|\d+\,\d+', al)) and \
                    len(al) > 5 and \
