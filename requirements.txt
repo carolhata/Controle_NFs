@@ -1,7 +1,7 @@
 streamlit==1.33.0
 pandas==2.2.2
 gspread==6.0.0
-Pillow==10.3.0  # Usamos 'Pillow' (com P maiúsculo) para o pacote Python.
+Pillow==10.3.0
 google-api-python-client==2.128.0
 pdfplumber==0.11.0
 python-magic==0.4.27
@@ -9,4 +9,4 @@ pytesseract==0.3.10
 gspread_dataframe==1.1.2
 numpy==1.26.4
 opencv-python==4.9.0.80
-google-auth==2.29.0 # Mantendo explicitamente, embora seja dependência de outros
+google-auth==2.29.0
