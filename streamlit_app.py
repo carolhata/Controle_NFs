@@ -79,13 +79,12 @@ LOGS_HEADER = ["drive_file_id", "filename", "processed_at", "status", "rows", "m
 @st.cache_resource(show_spinner=False)
 def load_service_account_info():
     """
-    Carrega o JSON da service account a partir de st.secrets.
-    - Procura por 'gcp_service_account' (preferido) e por 'GOOGLE_SERVICE_ACCOUNT' (fallback).
-    - Converte sequências '\\n' em quebras de linha reais.
-    - Remove aspas triplas/extras se alguém colou de forma errada.
-    - Retorna dict pronto para service_account.Credentials.from_service_account_info(...)
+    Carrega o JSON da service account a partir de st.secrets e aplica correções:
+     - procura por 'gcp_service_account' (preferido) e 'GOOGLE_SERVICE_ACCOUNT' (fallback)
+     - tenta json.loads direto
+     - se falhar por 'Invalid control character', converte quebras reais dentro do campo private_key
+       em escapes '\\n' e tenta json.loads novamente
     """
-    # 1) obter raw string do secrets (tolerante a dois nomes)
     raw = None
     if "gcp_service_account" in st.secrets:
         raw = st.secrets["gcp_service_account"]
@@ -95,34 +94,49 @@ def load_service_account_info():
         st.error("Secret 'gcp_service_account' não encontrado em Streamlit Secrets. Verifique Settings → Secrets.")
         st.stop()
 
-    # 2) normalizar tipo
     if not isinstance(raw, str):
         st.error("Formato inesperado do secret da service account (esperado string).")
         st.stop()
 
     s = raw.strip()
 
-    # 3) Converter barras duplas \\n em quebras de linha reais (se existirem)
-    #    Isso não altera uma string que já tem quebras de linha reais.
-    if "\\n" in s:
-        s = s.replace("\\n", "\n")
-
-    # 4) Remover aspas extras no início/fim se houver (algumas pessoas acidentalmente colocam aspas duplicadas)
-    if s.startswith('"""') and s.endswith('"""'):
-        s = s[3:-3].strip()
-    # se foi colocado entre aspas simples ou duplas extras (caso raro)
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        # Apenas remover uma camada externa de aspas se for o caso
-        s = s[1:-1]
-
-    # 5) Tentar fazer json.loads com tratamento
+    # Primeira tentativa direta
     try:
-        info = json.loads(s)
-        return info
+        return json.loads(s)
     except Exception as e:
-        st.error("Erro ao decodificar JSON da service account: " + str(e))
-        st.error("Verifique: nome do secret = 'gcp_service_account' e se a chave 'private_key' contém quebras de linha reais (sem '\\\\n').")
-        st.stop()
+        msg = str(e)
+        # Se for erro de caractere de controle (literal newline dentro da string JSON),
+        # vamos tentar consertar somente o campo private_key (substituir quebras reais por '\n').
+        if "Invalid control character" in msg or "expecting '\\\\u' escape" in msg.lower() or "newline" in msg.lower():
+            try:
+                # tentativa heurística:
+                # localizar o bloco entre "-----BEGIN PRIVATE KEY-----" e "-----END PRIVATE KEY-----"
+                begin_token = "-----BEGIN PRIVATE KEY-----"
+                end_token = "-----END PRIVATE KEY-----"
+                if begin_token in s and end_token in s:
+                    start = s.index(begin_token)
+                    end = s.index(end_token, start) + len(end_token)
+                    # extrai trecho e substitui quebras de linha reais por '\n'
+                    key_block = s[start:end]
+                    repaired_block = key_block.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+                    # substituir no JSON bruto
+                    s2 = s[:start] + repaired_block + s[end:]
+                else:
+                    # fallback: só converte novas linhas no JSON inteiro dentro das aspas do private_key
+                    s2 = s.replace("\r\n", "\n")
+                    # localizar "private_key": " ... " e converter quebras reais entre as aspas (heurístico)
+                    # simplest: replace occurrences of actual newlines between BEGIN/END if present (safer above)
+                    s2 = s2
+                info = json.loads(s2)
+                return info
+            except Exception as e2:
+                st.error("Erro ao tentar reparar JSON da service account: " + str(e2))
+                st.error("Dica: verifique se o secret 'gcp_service_account' contém o JSON exatamente como o arquivo .json do GCP (com '\\n' dentro de private_key), ou cole o arquivo original.")
+                st.stop()
+        else:
+            st.error("Erro ao decodificar JSON da service account: " + msg)
+            st.stop()
+
 
 
 @st.cache_resource(show_spinner=False)
