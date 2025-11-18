@@ -1,37 +1,40 @@
+
+
 """
 streamlit_app.py
-Aplicativo Streamlit: leitura de notas fiscais (XML | PDF/Imagens) numa pasta do Google Drive
-e exportação linha-a-linha para Google Sheets (cada item = uma linha).
+Versão atualizada:
+- Cria planilha automaticamente (se spreadsheet_id vazio)
+- Cria abas: DATA (dados extraídos) e LOGS (idempotência)
+- Idempotência por Drive file_id (evita duplicados)
+- XML-first + Google Vision OCR fallback
+- Usa st.secrets["gcp_service_account"] (NUNCA coloque JSON no código)
 
-Credenciais:
-- Defina st.secrets["gcp_service_account"] com O JSON da service account (string).
-- Opcional: st.secrets["default_drive_folder_id"], st.secrets["default_sheet_id"]
-
-Observações:
-- O app NO CAMPO inclui secrets no código. Use Streamlit Cloud Secrets.
-- Projetado para XML-first; se não houver XML, usa Google Vision Document OCR.
+Como usar:
+1) Adicione o JSON da service account em Streamlit Secrets com a chave:
+   gcp_service_account = """{ ... }"""
+2) Compartilhe a pasta do Drive e/ou a planilha com o email da service account.
+3) Abra o app, informe Drive Folder ID (ou use default nos Secrets), clique em 'Listar arquivos', selecione e processe.
 """
 
 import streamlit as st
 import json
-import io
 import os
+import io
 import tempfile
 import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from dateutil import parser as dateparser
 import pandas as pd
-import fitz  # pymupdf
+import fitz  # PyMuPDF
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.cloud import vision_v1
 from lxml import etree
-from tqdm import tqdm
 
 # -------------------------
-# CONFIG / CONSTANTS
+# CONFIG
 # -------------------------
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
@@ -46,9 +49,12 @@ VALUE_REGEX = re.compile(r'\d{1,3}(?:[.,]\d{3})*[.,]\d{2}')
 NOTE_NUMBER_REGEX = re.compile(r'(?:N(?:º|o)?\.?\s*|Nota\s*Fiscal\s*[:\-]?\s*)(\d{1,12})', re.IGNORECASE)
 DATE_REGEX = re.compile(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})')
 
-# Output sheet header
+DATA_SHEET_NAME = "DATA"
+LOGS_SHEET_NAME = "LOGS"
+
 SHEET_HEADER = [
     "source_filename",
+    "drive_file_id",
     "fornecedor_razao_social",
     "fornecedor_cnpj",
     "nota_numero",
@@ -66,38 +72,38 @@ SHEET_HEADER = [
     "observacoes"
 ]
 
+LOGS_HEADER = ["drive_file_id", "filename", "processed_at", "status", "rows", "message"]
+
 # -------------------------
-# UTIL / CREDENTIALS
+# CREDENTIALS / SERVICES
 # -------------------------
 @st.cache_resource(show_spinner=False)
 def load_service_account_info():
     if "gcp_service_account" not in st.secrets:
-        st.error("Coloque o JSON da service account em Streamlit Secrets: chave 'gcp_service_account'.")
+        st.error("Adicione o JSON da service account em Streamlit Secrets com a chave 'gcp_service_account'.")
         st.stop()
-    sa_json = st.secrets["gcp_service_account"]
     try:
-        info = json.loads(sa_json)
+        info = json.loads(st.secrets["gcp_service_account"])
     except Exception as e:
-        st.error("Erro ao carregar JSON da service account a partir de st.secrets['gcp_service_account'].")
+        st.error("Erro ao carregar o JSON da service account dos Secrets. Verifique o formato.")
         st.stop()
     return info
 
 @st.cache_resource(show_spinner=False)
-def build_google_services():
+def build_services():
     info = load_service_account_info()
-    credentials = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-    drive_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
-    sheets_service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
-    # Vision client requires separate credentials object with cloud-platform scope
-    vision_credentials = service_account.Credentials.from_service_account_info(info, scopes=[VISION_SCOPE])
-    vision_client = vision_v1.ImageAnnotatorClient(credentials=vision_credentials)
+    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    vision_creds = service_account.Credentials.from_service_account_info(info, scopes=[VISION_SCOPE])
+    vision_client = vision_v1.ImageAnnotatorClient(credentials=vision_creds)
     return drive_service, sheets_service, vision_client
 
 # -------------------------
-# DRIVE / SHEETS
+# DRIVE FUNCTIONS
 # -------------------------
 def list_files_in_folder(drive_service, folder_id):
-    """Lista arquivos (pdf, xml, jpg, png) na pasta do Drive."""
+    """Lista arquivos relevantes na pasta do Drive."""
     q = f"'{folder_id}' in parents and trashed=false"
     fields = "nextPageToken, files(id, name, mimeType, modifiedTime, size)"
     page_token = None
@@ -106,7 +112,6 @@ def list_files_in_folder(drive_service, folder_id):
         resp = drive_service.files().list(q=q, spaces='drive', fields=fields, pageToken=page_token, pageSize=200).execute()
         files = resp.get('files', [])
         for f in files:
-            # filtra por extensão relevante
             name = f.get("name", "").lower()
             if any(name.endswith(ext) for ext in (".pdf", ".xml", ".jpg", ".jpeg", ".png")):
                 results.append(f)
@@ -129,54 +134,38 @@ def download_drive_file(drive_service, file_id, dest_path):
 # XML PARSER
 # -------------------------
 def parse_nfe_xml(xml_path):
-    """
-    Parse basic NF-e XML structure (adequate for many NF-e).
-    Returns a list of dict rows (one per det/item).
-    """
+    """Parse simples para NF-e (cada det -> item)."""
     tree = etree.parse(xml_path)
-    ns = tree.getroot().nsmap
-    # some XMLs have default namespace None -> handle fallback
-    def find_text(path, node=None):
+    root = tree.getroot()
+    ns = root.nsmap
+    def find_text(node, path):
         try:
-            if node is None:
-                node = tree
             el = node.find(path, namespaces=ns)
             return el.text.strip() if el is not None and el.text else None
         except Exception:
             return None
 
-    root = tree.getroot()
-    # Common paths (may vary by layout); try multiple candidates
     emit = root.find('.//{*}emit')
     ide = root.find('.//{*}ide')
     total = root.find('.//{*}total')
     items = root.findall('.//{*}det')
 
-    fornecedor = None
-    cnpj = None
-    nota_num = None
-    nota_data = None
-    nota_valor_total = None
-
-    if emit is not None:
-        fornecedor = find_text('.//{*}xNome', node=emit) or find_text('.//{*}xFant', node=emit)
-        cnpj = find_text('.//{*}CNPJ', node=emit)
-    if ide is not None:
-        nota_num = find_text('.//{*}nNF', node=ide)
-        nota_data = find_text('.//{*}dEmi', node=ide)
-    if total is not None:
-        nota_valor_total = find_text('.//{*}vNF', node=total) or find_text('.//{*}vProd', node=total)
+    fornecedor = find_text(emit, './/{*}xNome') if emit is not None else None
+    cnpj = find_text(emit, './/{*}CNPJ') if emit is not None else None
+    nota_num = find_text(ide, './/{*}nNF') if ide is not None else None
+    nota_data = find_text(ide, './/{*}dEmi') if ide is not None else None
+    nota_valor_total = find_text(total, './/{*}vNF') if total is not None else None
 
     rows = []
     for idx, det in enumerate(items, start=1):
         prod = det.find('.//{*}prod')
         if prod is None:
             continue
-        descricao = find_text('.//{*}xProd', node=prod)
-        qCom = find_text('.//{*}qCom', node=prod)
-        vUnCom = find_text('.//{*}vUnCom', node=prod)
-        vProd = find_text('.//{*}vProd', node=prod)
-        row = {
+        descricao = find_text(prod, './/{*}xProd')
+        qCom = find_text(prod, './/{*}qCom')
+        vUnCom = find_text(prod, './/{*}vUnCom')
+        vProd = find_text(prod, './/{*}vProd')
+        rows.append({
             "fornecedor_razao_social": fornecedor,
             "fornecedor_cnpj": cnpj,
             "nota_numero": nota_num,
@@ -191,22 +180,19 @@ def parse_nfe_xml(xml_path):
             "metodo_extracao": "xml",
             "confidence": 1.0,
             "observacoes": ""
-        }
-        rows.append(row)
+        })
     return rows
 
 # -------------------------
 # PDF -> imagens
 # -------------------------
-def pdf_to_images(pdf_path):
-    """Renderiza cada página do PDF para imagem bytes (PNG). Retorna lista de bytes."""
+def pdf_to_images(pdf_path, zoom=2):
     images = []
     doc = fitz.open(pdf_path)
+    mat = fitz.Matrix(zoom, zoom)
     for page in doc:
-        mat = fitz.Matrix(2, 2)  # escala para melhor OCR
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        img_bytes = pix.tobytes(output="png")
-        images.append(img_bytes)
+        images.append(pix.tobytes(output="png"))
     doc.close()
     return images
 
@@ -214,40 +200,31 @@ def pdf_to_images(pdf_path):
 # VISION OCR
 # -------------------------
 def vision_document_ocr(vision_client, image_bytes):
-    """Chama Document OCR (DOCUMENT_TEXT_DETECTION) e retorna full text e blocks."""
     image = vision_v1.Image(content=image_bytes)
     response = vision_client.document_text_detection(image=image)
     if response.error.message:
         raise RuntimeError(response.error.message)
-    # Combine full text
-    full_text = response.full_text_annotation.text if response.full_text_annotation else ""
-    return full_text
+    return response.full_text_annotation.text if response.full_text_annotation else ""
 
 # -------------------------
-# TEXT EXTRACTION HEURISTICS
+# HEURÍSTICAS DE EXTRAÇÃO
 # -------------------------
 def extract_basic_fields_from_text(text):
-    """Extrai CNPJ/CPF/número/data/valores de um bloco de texto (heurístico)."""
     cnpj = None
     cpf = None
     nota_num = None
     nota_data = None
     probable_totals = []
 
-    # CNPJ / CPF
     cnpj_m = CNPJ_REGEX.search(text)
     if cnpj_m:
         cnpj = re.sub(r'\D', '', cnpj_m.group(0))
     cpf_m = CPF_REGEX.search(text)
     if cpf_m:
         cpf = re.sub(r'\D', '', cpf_m.group(0))
-
-    # nota numero
     nn = NOTE_NUMBER_REGEX.search(text)
     if nn:
         nota_num = nn.group(1)
-
-    # data
     dm = DATE_REGEX.search(text)
     if dm:
         try:
@@ -255,21 +232,19 @@ def extract_basic_fields_from_text(text):
         except Exception:
             nota_data = dm.group(1)
 
-    # valores (pegar top 5 maiores como candidatos a total)
     vals = VALUE_REGEX.findall(text)
     cleaned = []
     for v in vals:
         vv = v.replace('.', '').replace(',', '.')
         try:
             cleaned.append(Decimal(vv))
-        except InvalidOperation:
+        except Exception:
             continue
     cleaned.sort(reverse=True)
-    probable_totals = cleaned[:5]
-    nota_valor_total = str(probable_totals[0]) if probable_totals else None
+    nota_valor_total = str(cleaned[0]) if cleaned else None
 
     return {
-        "fornecedor_razao_social": None,  # hard to detect from plain text reliably
+        "fornecedor_razao_social": None,
         "fornecedor_cnpj": cnpj,
         "nota_numero": nota_num,
         "nota_data": nota_data,
@@ -279,74 +254,48 @@ def extract_basic_fields_from_text(text):
     }
 
 def extract_items_from_text_lines(text):
-    """
-    Heurística bem simples: separa o texto por linhas,
-    identifica linhas que contenham valores e quantidades, e agrupa como itens.
-    Retorna lista de dicts com descricao, quantidade, unitario, total.
-    OBS: abordagem genérica — corrigir no preview.
-    """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    item_rows = []
+    items = []
     idx = 0
-    for i, line in enumerate(lines):
-        # busca valores na linha
+    for line in lines:
         values = VALUE_REGEX.findall(line)
         if not values:
             continue
-        # heurística: se linha tem 2 ou 3 valores -> pode ser: qty unit total  OR unit total
-        if len(values) >= 2:
-            # descrição = part before first value
-            first_val_span = VALUE_REGEX.search(line)
-            desc = line[:first_val_span.start()].strip()
-            # pegar os últimos dois valores como unit e total (ou somente total)
-            last_vals = values[-2:] if len(values) >= 2 else [values[-1]]
-            qty = None
-            unit = None
-            total = None
+        first_val_match = VALUE_REGEX.search(line)
+        desc = line[:first_val_match.start()].strip() if first_val_match else line
+        last_vals = values[-2:] if len(values) >= 2 else values
+        unit = None; total = None
+        try:
             if len(last_vals) == 2:
-                try:
-                    unit = Decimal(last_vals[-2].replace('.', '').replace(',', '.'))
-                except Exception:
-                    unit = None
-                try:
-                    total = Decimal(last_vals[-1].replace('.', '').replace(',', '.'))
-                except Exception:
-                    total = None
-            elif len(last_vals) == 1:
-                try:
-                    total = Decimal(last_vals[-1].replace('.', '').replace(',', '.'))
-                except Exception:
-                    total = None
-            idx += 1
-            item_rows.append({
-                "item_index": idx,
-                "item_descricao": desc or None,
-                "item_quantidade": qty,
-                "item_valor_unitario": unit,
-                "item_valor_total": total
-            })
-        else:
-            continue
-    return item_rows
+                unit = Decimal(last_vals[-2].replace('.', '').replace(',', '.'))
+                total = Decimal(last_vals[-1].replace('.', '').replace(',', '.'))
+            else:
+                total = Decimal(last_vals[-1].replace('.', '').replace(',', '.'))
+        except Exception:
+            pass
+        idx += 1
+        items.append({
+            "item_index": idx,
+            "item_descricao": desc or None,
+            "item_quantidade": None,
+            "item_valor_unitario": unit,
+            "item_valor_total": total
+        })
+    return items
 
 # -------------------------
-# NORMALIZAÇÃO / CONSTRUÇÃO DE DF
+# BUILD ROWS
 # -------------------------
-def build_rows_from_file(filename, xml_rows=None, ocr_text=None, ocr_items=None, metodo="xml"):
-    """
-    Monta lista de output rows respeitando SHEET_HEADER.
-    xml_rows: output do parse_nfe_xml
-    ocr_text: dict com campos básicos
-    ocr_items: lista de itens heurísticos
-    """
+def build_rows_from_extraction(filename, file_id, xml_rows=None, ocr_text=None, ocr_items=None, metodo="xml"):
     rows = []
     processed_at = datetime.utcnow().isoformat()
     if metodo == "xml" and xml_rows:
         for r in xml_rows:
-            out = {
+            rows.append({
                 "source_filename": filename,
+                "drive_file_id": file_id,
                 "fornecedor_razao_social": r.get("fornecedor_razao_social"),
-                "fornecedor_cnpj": re.sub(r'\D', '', r.get("fornecedor_cnpj") or "") if r.get("fornecedor_cnpj") else None,
+                "fornecedor_cnpj": re.sub(r'\D', '', (r.get("fornecedor_cnpj") or "")) if r.get("fornecedor_cnpj") else None,
                 "nota_numero": r.get("nota_numero"),
                 "nota_data": r.get("nota_data"),
                 "item_index": r.get("item_index"),
@@ -360,14 +309,13 @@ def build_rows_from_file(filename, xml_rows=None, ocr_text=None, ocr_items=None,
                 "confidence": 1.0,
                 "processed_at": processed_at,
                 "observacoes": r.get("observacoes", "")
-            }
-            rows.append(out)
+            })
     else:
-        # usar ocr_text + ocr_items
         base = ocr_text or {}
         for item in (ocr_items or []):
-            out = {
+            rows.append({
                 "source_filename": filename,
+                "drive_file_id": file_id,
                 "fornecedor_razao_social": base.get("fornecedor_razao_social"),
                 "fornecedor_cnpj": base.get("fornecedor_cnpj"),
                 "nota_numero": base.get("nota_numero"),
@@ -383,170 +331,211 @@ def build_rows_from_file(filename, xml_rows=None, ocr_text=None, ocr_items=None,
                 "confidence": 0.6,
                 "processed_at": processed_at,
                 "observacoes": base.get("observacoes", "")
-            }
-            rows.append(out)
+            })
     return rows
 
 # -------------------------
-# SHEETS WRITE
+# SHEETS HELPERS
 # -------------------------
-def append_rows_to_sheet(sheets_service, spreadsheet_id, rows, sheet_name="Sheet1"):
-    """
-    Aplica append de linhas (rows: list of dicts) para a planilha.
-    Se planilha vazia, escreve header antes.
-    """
+def create_spreadsheet_if_missing(sheets_service, spreadsheet_id, title="Notas_Extracao"):
+    if spreadsheet_id:
+        return spreadsheet_id
+    body = {
+        "properties": {"title": title},
+        "sheets": [
+            {"properties": {"title": DATA_SHEET_NAME}},
+            {"properties": {"title": LOGS_SHEET_NAME}}
+        ]
+    }
+    resp = sheets_service.spreadsheets().create(body=body).execute()
+    new_id = resp.get("spreadsheetId")
+    # write headers
+    header_range = f"{DATA_SHEET_NAME}!A1"
+    sheets_service.spreadsheets().values().update(
+        spreadsheetId=new_id, range=header_range, valueInputOption="RAW",
+        body={"values":[SHEET_HEADER]}
+    ).execute()
+    logs_range = f"{LOGS_SHEET_NAME}!A1"
+    sheets_service.spreadsheets().values().update(
+        spreadsheetId=new_id, range=logs_range, valueInputOption="RAW",
+        body={"values":[LOGS_HEADER]}
+    ).execute()
+    return new_id
+
+def ensure_sheets_and_headers(sheets_service, spreadsheet_id):
+    # ensure DATA and LOGS exist and have headers
+    meta = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    requests = []
+    if DATA_SHEET_NAME not in titles:
+        requests.append({"addSheet": {"properties": {"title": DATA_SHEET_NAME}}})
+    if LOGS_SHEET_NAME not in titles:
+        requests.append({"addSheet": {"properties": {"title": LOGS_SHEET_NAME}}})
+    if requests:
+        sheets_service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
+    # ensure headers present
+    try:
+        df_head = sheets_service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=f"{DATA_SHEET_NAME}!A1:Z1").execute()
+        if "values" not in df_head or not df_head["values"]:
+            sheets_service.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f"{DATA_SHEET_NAME}!A1", valueInputOption="RAW", body={"values":[SHEET_HEADER]}).execute()
+    except Exception:
+        sheets_service.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f"{DATA_SHEET_NAME}!A1", valueInputOption="RAW", body={"values":[SHEET_HEADER]}).execute()
+    try:
+        logs_head = sheets_service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=f"{LOGS_SHEET_NAME}!A1:Z1").execute()
+        if "values" not in logs_head or not logs_head["values"]:
+            sheets_service.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f"{LOGS_SHEET_NAME}!A1", valueInputOption="RAW", body={"values":[LOGS_HEADER]}).execute()
+    except Exception:
+        sheets_service.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f"{LOGS_SHEET_NAME}!A1", valueInputOption="RAW", body={"values":[LOGS_HEADER]}).execute()
+
+def read_processed_file_ids(sheets_service, spreadsheet_id):
+    """Lê o LOGS e retorna set de drive_file_id já processados."""
+    try:
+        resp = sheets_service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=f"{LOGS_SHEET_NAME}!A2:A10000").execute()
+        rows = resp.get("values", [])
+        return set(r[0] for r in rows if r)
+    except Exception:
+        return set()
+
+def append_rows_to_sheet(sheets_service, spreadsheet_id, rows, sheet_name=DATA_SHEET_NAME):
     if not rows:
         return {"updatedRows": 0}
-    # Build values
-    values = []
-    for r in rows:
-        rowvals = [r.get(h) for h in SHEET_HEADER]
-        values.append(rowvals)
+    values = [[r.get(h) for h in SHEET_HEADER] for r in rows]
     body = {"values": values}
-    range_name = f"{sheet_name}!A1"
-    # Check if sheet has header: read A1
-    try:
-        sheet = sheets_service.spreadsheets()
-        # Append
-        resp = sheet.values().append(spreadsheetId=spreadsheet_id, range=range_name,
-                                     valueInputOption="USER_ENTERED", body=body).execute()
-        return resp
-    except Exception as e:
-        st.error(f"Erro ao escrever no Google Sheets: {e}")
-        return None
+    resp = sheets_service.spreadsheets().values().append(spreadsheetId=spreadsheet_id, range=f"{sheet_name}!A1", valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS", body=body).execute()
+    return resp
+
+def append_log_entry(sheets_service, spreadsheet_id, log_row):
+    body = {"values": [log_row]}
+    resp = sheets_service.spreadsheets().values().append(spreadsheetId=spreadsheet_id, range=f"{LOGS_SHEET_NAME}!A1", valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS", body=body).execute()
+    return resp
 
 # -------------------------
-# MAIN APP
+# MAIN UI / ORCHESTRATION
 # -------------------------
 def main():
     st.set_page_config(page_title="Leitura de Notas - Streamlit", layout="wide")
-    st.title("Leitura de Notas Fiscais (XML-first + Google Vision)")
+    st.title("Leitura de Notas Fiscais — XML-first + Vision (com LOGS e idempotência)")
 
-    # Build services
-    drive_service, sheets_service, vision_client = build_google_services()
+    drive_service, sheets_service, vision_client = build_services()
 
-    # Sidebar controls
     st.sidebar.header("Configurações")
     folder_id = st.sidebar.text_input("Drive Folder ID", value=st.secrets.get("default_drive_folder_id", ""))
-    spreadsheet_id = st.sidebar.text_input("Google Sheets ID (onde salvar)", value=st.secrets.get("default_sheet_id", ""))
-    sheet_name = st.sidebar.text_input("Nome da aba (Sheet)", value="Sheet1")
-    process_new_only = st.sidebar.checkbox("Processar apenas arquivos não processados (recomendado)", value=True)
-    st.sidebar.caption("Importante: compartilhe a pasta do Drive com a service account utilizada.")
+    spreadsheet_id_input = st.sidebar.text_input("Google Sheets ID (deixe vazio para criar automaticamente)", value=st.secrets.get("default_sheet_id", ""))
+    sheet_name = DATA_SHEET_NAME
+    process_only_new = st.sidebar.checkbox("Processar apenas arquivos não processados (recomendado)", value=True)
+    st.sidebar.caption("Compartilhe a pasta/planilha com o email da service account.")
 
     if not folder_id:
-        st.warning("Insira o Drive Folder ID (na sidebar) para prosseguir.")
+        st.warning("Insira o Drive Folder ID na sidebar para prosseguir.")
         st.stop()
 
-    cols = st.columns([2,1,1])
-    with cols[0]:
-        if st.button("Listar arquivos na pasta"):
-            with st.spinner("Listando..."):
-                files = list_files_in_folder(drive_service, folder_id)
-                st.session_state["drive_files"] = files
-                st.success(f"{len(files)} arquivo(s) encontrados.")
-    if "drive_files" in st.session_state:
-        files = st.session_state["drive_files"]
-    else:
-        files = []
+    if st.button("Listar arquivos na pasta"):
+        with st.spinner("Listando arquivos..."):
+            files = list_files_in_folder(drive_service, folder_id)
+            st.session_state["drive_files"] = files
+            st.success(f"{len(files)} arquivo(s) encontrados.")
+    files = st.session_state.get("drive_files", [])
 
     st.subheader("Arquivos encontrados")
     if files:
-        df_files = pd.DataFrame([{
-            "name": f.get("name"),
-            "id": f.get("id"),
-            "mimeType": f.get("mimeType"),
-            "modifiedTime": f.get("modifiedTime"),
-            "size": f.get("size")
-        } for f in files])
+        df_files = pd.DataFrame([{"name": f.get("name"), "id": f.get("id"), "mimeType": f.get("mimeType"), "modifiedTime": f.get("modifiedTime")} for f in files])
         st.dataframe(df_files)
     else:
-        st.info("Nenhum arquivo listado ainda. Clique em 'Listar arquivos na pasta'.")
+        st.info("Clique em 'Listar arquivos na pasta' para ver arquivos.")
 
     st.markdown("---")
     st.subheader("Processamento em lote")
-    selected = st.multiselect("Selecione arquivos para processar (por nome)", options=[f.get("name") for f in files], default=[f.get("name") for f in files][:5])
+    selected_names = st.multiselect("Selecione arquivos para processar", options=[f.get("name") for f in files], default=[f.get("name") for f in files][:5])
+    to_process = [f for f in files if f.get("name") in selected_names]
 
     if st.button("Processar arquivos selecionados"):
-        if not spreadsheet_id:
-            st.error("Insira o Google Sheets ID (sidebar) antes de processar.")
-            st.stop()
-        to_process = [f for f in files if f.get("name") in selected]
+        # create spreadsheet if needed
+        spreadsheet_id = create_spreadsheet_if_missing(sheets_service, spreadsheet_id_input, title="Notas_Extracao")
+        ensure_sheets_and_headers(sheets_service, spreadsheet_id)
+        processed_ids = read_processed_file_ids(sheets_service, spreadsheet_id)
         overall_rows = []
-        progress_bar = st.progress(0)
+        progress = st.progress(0)
+        total = len(to_process)
         for i, f in enumerate(to_process):
             fname = f.get("name")
             fid = f.get("id")
+            if process_only_new and fid in processed_ids:
+                st.info(f"Pulado (já processado): {fname}")
+                progress.progress(int((i+1)/total*100))
+                continue
             st.info(f"Processando: {fname}")
-            with st.spinner(f"Baixando {fname}..."):
-                tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(fname)[1])
-                tmpf.close()
-                try:
-                    download_drive_file(drive_service, fid, tmpf.name)
-                except Exception as e:
-                    st.error(f"Erro ao baixar {fname}: {e}")
-                    continue
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(fname)[1])
+            tmp.close()
+            try:
+                download_drive_file(drive_service, fid, tmp.name)
+            except Exception as e:
+                st.error(f"Erro ao baixar {fname}: {e}")
+                append_log_entry(sheets_service, spreadsheet_id, [fid, fname, datetime.utcnow().isoformat(), "FAILED_DOWNLOAD", 0, str(e)])
+                progress.progress(int((i+1)/total*100))
+                continue
 
-            # if xml present
-            if fname.lower().endswith(".xml"):
-                try:
-                    xml_rows = parse_nfe_xml(tmpf.name)
-                    rows = build_rows_from_file(fname, xml_rows=xml_rows, metodo="xml")
-                    overall_rows.extend(rows)
-                    st.success(f"{len(rows)} itens extraídos (XML).")
-                except Exception as e:
-                    st.error(f"Erro ao parsear XML {fname}: {e}")
-            elif fname.lower().endswith(".pdf"):
-                try:
-                    images = pdf_to_images(tmpf.name)
+            extracted_rows = []
+            method = None
+            message = ""
+            try:
+                if fname.lower().endswith(".xml"):
+                    xml_rows = parse_nfe_xml(tmp.name)
+                    extracted_rows = build_rows_from_extraction(fname, fid, xml_rows=xml_rows, metodo="xml")
+                    method = "xml"
+                elif fname.lower().endswith(".pdf"):
+                    images = pdf_to_images(tmp.name, zoom=2)
                     combined_items = []
-                    base_text_info = {"fornecedor_razao_social": None, "fornecedor_cnpj": None, "nota_numero": None,
-                                      "nota_data": None, "nota_valor_total": None, "cpf_associado": None, "observacoes": ""}
+                    base_info = {"fornecedor_razao_social": None, "fornecedor_cnpj": None, "nota_numero": None, "nota_data": None, "nota_valor_total": None, "cpf_associado": None, "observacoes": ""}
                     for img_b in images:
                         text = vision_document_ocr(vision_client, img_b)
                         info = extract_basic_fields_from_text(text)
-                        # merge basic info (prefer first non-null)
-                        for k,v in info.items():
-                            if base_text_info.get(k) is None and v:
-                                base_text_info[k] = v
+                        for k, v in info.items():
+                            if base_info.get(k) is None and v:
+                                base_info[k] = v
                         items = extract_items_from_text_lines(text)
                         combined_items.extend(items)
-                    rows = build_rows_from_file(fname, xml_rows=None, ocr_text=base_text_info, ocr_items=combined_items, metodo="vision")
-                    overall_rows.extend(rows)
-                    st.success(f"{len(rows)} itens extraídos (Vision OCR heurístico).")
-                except Exception as e:
-                    st.error(f"Erro ao processar PDF {fname}: {e}")
-            elif any(fname.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
-                try:
-                    with open(tmpf.name, "rb") as fimg:
+                    extracted_rows = build_rows_from_extraction(fname, fid, xml_rows=None, ocr_text=base_info, ocr_items=combined_items, metodo="vision")
+                    method = "vision"
+                elif any(fname.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
+                    with open(tmp.name, "rb") as fimg:
                         img_b = fimg.read()
                     text = vision_document_ocr(vision_client, img_b)
-                    base = extract_basic_fields_from_text(text)
+                    base_info = extract_basic_fields_from_text(text)
                     items = extract_items_from_text_lines(text)
-                    rows = build_rows_from_file(fname, xml_rows=None, ocr_text=base, ocr_items=items, metodo="vision")
-                    overall_rows.extend(rows)
-                    st.success(f"{len(rows)} itens extraídos (imagem).")
+                    extracted_rows = build_rows_from_extraction(fname, fid, xml_rows=None, ocr_text=base_info, ocr_items=items, metodo="vision")
+                    method = "vision"
+                else:
+                    message = "Formato não suportado"
+            except Exception as e:
+                st.error(f"Erro ao processar {fname}: {e}")
+                message = str(e)
+
+            # append to sheet if we have rows
+            if extracted_rows:
+                try:
+                    append_rows_to_sheet(sheets_service, spreadsheet_id, extracted_rows, sheet_name=DATA_SHEET_NAME)
+                    append_log_entry(sheets_service, spreadsheet_id, [fid, fname, datetime.utcnow().isoformat(), "OK", len(extracted_rows), method or message])
+                    st.success(f"{len(extracted_rows)} linhas adicionadas (arquivo: {fname}).")
                 except Exception as e:
-                    st.error(f"Erro ao processar imagem {fname}: {e}")
+                    st.error(f"Erro ao gravar no Sheets: {e}")
+                    append_log_entry(sheets_service, spreadsheet_id, [fid, fname, datetime.utcnow().isoformat(), "FAILED_SHEETS", 0, str(e)])
             else:
-                st.warning(f"Formato não suportado: {fname}")
+                st.warning(f"Nenhuma linha extraída de {fname}.")
+                append_log_entry(sheets_service, spreadsheet_id, [fid, fname, datetime.utcnow().isoformat(), "NO_ROWS", 0, message or method])
 
-            # update progress
-            progress_bar.progress(int((i+1)/len(to_process)*100))
+            # mark as processed for this run
+            processed_ids.add(fid)
+            progress.progress(int((i+1)/total*100))
 
-        # Preview + edit
-        if overall_rows:
-            df = pd.DataFrame(overall_rows)
-            st.markdown("### Pré-visualização das linhas extraídas (edite se necessário)")
-            edited = st.data_editor(df, num_rows="dynamic")
-            st.markdown("Quando estiver pronto, clique em **Enviar para Google Sheets**.")
-            if st.button("Enviar para Google Sheets"):
-                with st.spinner("Gravando no Google Sheets..."):
-                    resp = append_rows_to_sheet(sheets_service, spreadsheet_id, edited.to_dict(orient="records"), sheet_name=sheet_name)
-                    st.success("Linhas enviadas.")
-                    st.write(resp)
-        else:
-            st.info("Nenhuma linha extraída.")
+        st.success("Processamento finalizado. Verifique a planilha.")
+        # show preview of recent logs
+        try:
+            logs = sheets_service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=f"{LOGS_SHEET_NAME}!A1:F20").execute().get("values", [])
+            if logs:
+                st.markdown("Últimos registros (LOGS):")
+                st.dataframe(pd.DataFrame(logs[1:], columns=logs[0]))
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
-
