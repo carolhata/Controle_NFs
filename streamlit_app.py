@@ -78,15 +78,52 @@ LOGS_HEADER = ["drive_file_id", "filename", "processed_at", "status", "rows", "m
 # -------------------------
 @st.cache_resource(show_spinner=False)
 def load_service_account_info():
-    if "gcp_service_account" not in st.secrets:
-        st.error("Adicione o JSON da service account em Streamlit Secrets com a chave 'gcp_service_account'.")
+    """
+    Carrega o JSON da service account a partir de st.secrets.
+    - Procura por 'gcp_service_account' (preferido) e por 'GOOGLE_SERVICE_ACCOUNT' (fallback).
+    - Converte sequências '\\n' em quebras de linha reais.
+    - Remove aspas triplas/extras se alguém colou de forma errada.
+    - Retorna dict pronto para service_account.Credentials.from_service_account_info(...)
+    """
+    # 1) obter raw string do secrets (tolerante a dois nomes)
+    raw = None
+    if "gcp_service_account" in st.secrets:
+        raw = st.secrets["gcp_service_account"]
+    elif "GOOGLE_SERVICE_ACCOUNT" in st.secrets:
+        raw = st.secrets["GOOGLE_SERVICE_ACCOUNT"]
+    else:
+        st.error("Secret 'gcp_service_account' não encontrado em Streamlit Secrets. Verifique Settings → Secrets.")
         st.stop()
+
+    # 2) normalizar tipo
+    if not isinstance(raw, str):
+        st.error("Formato inesperado do secret da service account (esperado string).")
+        st.stop()
+
+    s = raw.strip()
+
+    # 3) Converter barras duplas \\n em quebras de linha reais (se existirem)
+    #    Isso não altera uma string que já tem quebras de linha reais.
+    if "\\n" in s:
+        s = s.replace("\\n", "\n")
+
+    # 4) Remover aspas extras no início/fim se houver (algumas pessoas acidentalmente colocam aspas duplicadas)
+    if s.startswith('"""') and s.endswith('"""'):
+        s = s[3:-3].strip()
+    # se foi colocado entre aspas simples ou duplas extras (caso raro)
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        # Apenas remover uma camada externa de aspas se for o caso
+        s = s[1:-1]
+
+    # 5) Tentar fazer json.loads com tratamento
     try:
-        info = json.loads(st.secrets["gcp_service_account"])
+        info = json.loads(s)
+        return info
     except Exception as e:
-        st.error("Erro ao carregar o JSON da service account dos Secrets. Verifique o formato.")
+        st.error("Erro ao decodificar JSON da service account: " + str(e))
+        st.error("Verifique: nome do secret = 'gcp_service_account' e se a chave 'private_key' contém quebras de linha reais (sem '\\\\n').")
         st.stop()
-    return info
+
 
 @st.cache_resource(show_spinner=False)
 def build_services():
