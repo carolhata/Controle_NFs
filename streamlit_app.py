@@ -80,71 +80,64 @@ LOGS_HEADER = ["drive_file_id", "filename", "processed_at", "status", "rows", "m
 def load_service_account_info():
     """
     Carrega o JSON da service account a partir de st.secrets e aplica correções:
-     - procura por 'gcp_service_account' (preferido) e 'GOOGLE_SERVICE_ACCOUNT' (fallback)
-     - tenta json.loads direto
-     - se falhar por 'Invalid control character', converte quebras reais dentro do campo private_key
-       em escapes '\\n' e tenta json.loads novamente
+      - tenta 'gcp_service_account' e 'GOOGLE_SERVICE_ACCOUNT'
+      - se houver \\n, converte para \n
+      - se houver quebras reais na private_key, converte para \\n
     """
-    raw = None
+    # localizar secret
     if "gcp_service_account" in st.secrets:
         raw = st.secrets["gcp_service_account"]
     elif "GOOGLE_SERVICE_ACCOUNT" in st.secrets:
         raw = st.secrets["GOOGLE_SERVICE_ACCOUNT"]
     else:
-        st.error("Secret 'gcp_service_account' não encontrado em Streamlit Secrets. Verifique Settings → Secrets.")
+        st.error("Secret 'gcp_service_account' não encontrado em Settings → Secrets.")
         st.stop()
 
     if not isinstance(raw, str):
-        st.error("Formato inesperado do secret da service account (esperado string).")
+        st.error("Secret da service account deve ser uma string.")
         st.stop()
 
     s = raw.strip()
 
-    # diagnóstico (remover depois): mostra se o private_key contém '\n' ou quebras reais
-if '"private_key"' in s:
-    # mostra se há sequências backslash-n (\\n) presentes ou se há quebras reais '\n' no valor
-    has_escaped = "\\n" in s
-    has_real_newlines = "-----BEGIN PRIVATE KEY-----" in s and "\n" in s[s.index("-----BEGIN PRIVATE KEY-----"):s.index("-----END PRIVATE KEY-----")]
-    st.write({"has_escaped": has_escaped, "has_real_newlines_in_key_block": has_real_newlines})
-
-    # Primeira tentativa direta
+    # PRIMEIRA tentativa: json.loads direto
     try:
         return json.loads(s)
     except Exception as e:
         msg = str(e)
-        # Se for erro de caractere de controle (literal newline dentro da string JSON),
-        # vamos tentar consertar somente o campo private_key (substituir quebras reais por '\n').
-        if "Invalid control character" in msg or "expecting '\\\\u' escape" in msg.lower() or "newline" in msg.lower():
+
+        # Erros típicos de private_key com quebras de linha reais
+        if "Invalid control character" in msg or "newline" in msg.lower():
             try:
-                # tentativa heurística:
-                # localizar o bloco entre "-----BEGIN PRIVATE KEY-----" e "-----END PRIVATE KEY-----"
-                begin_token = "-----BEGIN PRIVATE KEY-----"
-                end_token = "-----END PRIVATE KEY-----"
-                if begin_token in s and end_token in s:
-                    start = s.index(begin_token)
-                    end = s.index(end_token, start) + len(end_token)
-                    # extrai trecho e substitui quebras de linha reais por '\n'
-                    key_block = s[start:end]
-                    repaired_block = key_block.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
-                    # substituir no JSON bruto
-                    s2 = s[:start] + repaired_block + s[end:]
+                # localizar bloco da private_key
+                begin = "-----BEGIN PRIVATE KEY-----"
+                end = "-----END PRIVATE KEY-----"
+
+                if begin in s and end in s:
+                    start = s.index(begin)
+                    finish = s.index(end) + len(end)
+
+                    key_block = s[start:finish]
+
+                    # converte quebras reais para \n
+                    fixed_block = key_block.replace("\r\n", "\n").replace("\r", "\n")
+                    fixed_block = fixed_block.replace("\n", "\\n")
+
+                    # substituir no json bruto
+                    s2 = s[:start] + fixed_block + s[finish:]
+
+                    return json.loads(s2)
+
                 else:
-                    # fallback: só converte novas linhas no JSON inteiro dentro das aspas do private_key
-                    s2 = s.replace("\r\n", "\n")
-                    # localizar "private_key": " ... " e converter quebras reais entre as aspas (heurístico)
-                    # simplest: replace occurrences of actual newlines between BEGIN/END if present (safer above)
-                    s2 = s2
-                info = json.loads(s2)
-                return info
+                    st.error("Não encontrei o bloco private_key. Verifique se o JSON está completo.")
+                    st.stop()
+
             except Exception as e2:
-                st.error("Erro ao tentar reparar JSON da service account: " + str(e2))
-                st.error("Dica: verifique se o secret 'gcp_service_account' contém o JSON exatamente como o arquivo .json do GCP (com '\\n' dentro de private_key), ou cole o arquivo original.")
+                st.error("Falha ao reparar o JSON da service account: " + str(e2))
                 st.stop()
-        else:
-            st.error("Erro ao decodificar JSON da service account: " + msg)
-            st.stop()
 
-
+        # Outros erros
+        st.error("Erro ao decodificar JSON da service account: " + msg)
+        st.stop()
 
 @st.cache_resource(show_spinner=False)
 def build_services():
