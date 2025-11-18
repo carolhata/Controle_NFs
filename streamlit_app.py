@@ -100,6 +100,13 @@ def load_service_account_info():
 
     s = raw.strip()
 
+    # diagnóstico (remover depois): mostra se o private_key contém '\n' ou quebras reais
+if '"private_key"' in s:
+    # mostra se há sequências backslash-n (\\n) presentes ou se há quebras reais '\n' no valor
+    has_escaped = "\\n" in s
+    has_real_newlines = "-----BEGIN PRIVATE KEY-----" in s and "\n" in s[s.index("-----BEGIN PRIVATE KEY-----"):s.index("-----END PRIVATE KEY-----")]
+    st.write({"has_escaped": has_escaped, "has_real_newlines_in_key_block": has_real_newlines})
+
     # Primeira tentativa direta
     try:
         return json.loads(s)
