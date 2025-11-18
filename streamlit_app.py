@@ -11,7 +11,6 @@ Versão atualizada:
 
 Como usar:
 1) Adicione o JSON da service account em Streamlit Secrets com a chave:
-   gcp_service_account = """{ ... }"""
 2) Compartilhe a pasta do Drive e/ou a planilha com o email da service account.
 3) Abra o app, informe Drive Folder ID (ou use default nos Secrets), clique em 'Listar arquivos', selecione e processe.
 """
